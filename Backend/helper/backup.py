@@ -1,9 +1,11 @@
+import asyncio
 import re
 from datetime import datetime
 
 from bson import ObjectId
 
 from Backend import __version__, db
+from Backend.helper.memory import release_memory
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 
@@ -56,46 +58,52 @@ def _revive(obj):
 
 
 async def export_config() -> dict:
-    settings = {k: v for k, v in SettingsManager.current().to_dict().items() if k not in _SETTINGS_EXCLUDE}
-    data = {
-        "app": "telegram-stremio",
-        "version": __version__,
-        "exported_at": datetime.utcnow().isoformat(),
-        "settings": settings,
-    }
-    for label, coll in _COLLECTIONS.items():
-        data[label] = await db.dbs["tracking"][coll].find({}).to_list(None)
-    return _jsonify(data)
+    try:
+        settings = {k: v for k, v in SettingsManager.current().to_dict().items() if k not in _SETTINGS_EXCLUDE}
+        data = {
+            "app": "telegram-stremio",
+            "version": __version__,
+            "exported_at": datetime.utcnow().isoformat(),
+            "settings": settings,
+        }
+        for label, coll in _COLLECTIONS.items():
+            data[label] = await db.dbs["tracking"][coll].find({}).to_list(None)
+        return _jsonify(data)
+    finally:
+        await asyncio.to_thread(release_memory, "backup-export")
 
 
 async def import_config(payload: dict) -> dict:
     if not isinstance(payload, dict) or payload.get("app") != "telegram-stremio":
         raise ValueError("This doesn't look like a Telegram-Stremio backup file.")
 
-    result = {}
+    try:
+        result = {}
 
-    #----- Settings: apply via SettingsManager.update so extra databases connect
-    #----- and multi-token clients start (password/secret are preserved).
-    settings = payload.get("settings")
-    if isinstance(settings, dict):
-        clean = {k: v for k, v in settings.items() if k not in _SETTINGS_EXCLUDE and k != "_id"}
-        if clean:
-            reinit = await SettingsManager.update(db, clean)
-            result["settings"] = f"{len(clean)} keys applied"
-            if reinit:
-                result["reinit"] = reinit
+        #----- Settings: apply via SettingsManager.update so extra databases connect
+        #----- and multi-token clients start (password/secret are preserved).
+        settings = payload.get("settings")
+        if isinstance(settings, dict):
+            clean = {k: v for k, v in settings.items() if k not in _SETTINGS_EXCLUDE and k != "_id"}
+            if clean:
+                reinit = await SettingsManager.update(db, clean)
+                result["settings"] = f"{len(clean)} keys applied"
+                if reinit:
+                    result["reinit"] = reinit
 
-    #----- Collections: replace with the backup's contents
-    for label, coll in _COLLECTIONS.items():
-        section = payload.get(label)
-        if not isinstance(section, list):
-            continue
-        docs = [_revive(d) for d in section if isinstance(d, dict)]
-        collection = db.dbs["tracking"][coll]
-        await collection.delete_many({})
-        if docs:
-            await collection.insert_many(docs)
-        result[label] = f"{len(docs)} restored"
+        #----- Collections: replace with the backup's contents
+        for label, coll in _COLLECTIONS.items():
+            section = payload.get(label)
+            if not isinstance(section, list):
+                continue
+            docs = [_revive(d) for d in section if isinstance(d, dict)]
+            collection = db.dbs["tracking"][coll]
+            await collection.delete_many({})
+            if docs:
+                await collection.insert_many(docs)
+            result[label] = f"{len(docs)} restored"
 
-    LOGGER.info(f"[BACKUP] Config restored: {result}")
-    return result
+        LOGGER.info(f"[BACKUP] Config restored: {result}")
+        return result
+    finally:
+        await asyncio.to_thread(release_memory, "backup-import")

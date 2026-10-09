@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 
+from Backend.helper.memory import release_memory, spawn
 from Backend.helper.metadata import tmdb_api_key
 from Backend.logger import LOGGER
 
@@ -352,6 +353,29 @@ async def _fetch_tmdb_data(client: httpx.AsyncClient, doc: dict) -> tuple[dict, 
     return details, providers
 
 
+# Keep in sync with fields read downstream across classification and collection pipelines
+MEDIA_PROJECTION = {
+    "_id": 1,
+    "tmdb_id": 1,
+    "imdb_id": 1,
+    "title": 1,
+    "media_type": 1,
+    "updated_on": 1,
+    "visibility": 1,
+    "allowed_tokens": 1,
+    "exclusive_catalog_id": 1,
+    "release_year": 1,
+    "is_anime": 1,
+    "original_language": 1,
+    "origin_country": 1,
+    "production_countries": 1,
+    "rating": 1,
+    "watch_providers": 1,
+    "auto_tags": 1,
+    "auto_catalog": 1,
+}
+
+
 async def _iter_all_media(db, *, force_refresh: bool = False):
     for db_index in range(1, db.current_db_index + 1):
         db_key = f"storage_{db_index}"
@@ -359,7 +383,10 @@ async def _iter_all_media(db, *, force_refresh: bool = False):
             continue
 
         for collection_name in ["movie", "tv"]:
-            cursor = db.dbs[db_key][collection_name].find({"tmdb_id": {"$exists": True, "$ne": None}})
+            cursor = db.dbs[db_key][collection_name].find(
+                {"tmdb_id": {"$exists": True, "$ne": None}},
+                MEDIA_PROJECTION,
+            )
             async for doc in cursor:
                 doc["db_index"] = db_index
                 doc["media_type"] = "tv" if collection_name == "tv" else "movie"
@@ -461,7 +488,7 @@ def start_single_media_catalog_sync(db, *, tmdb_id, media_type: str) -> None:
             LOGGER.exception("Instant auto catalog index failed")
 
     try:
-        asyncio.create_task(runner())
+        spawn(runner(), name="instant-auto-catalog")
     except RuntimeError:
         #----- No running loop (shouldn't happen inside the bot); ignore.
         LOGGER.warning("Instant auto catalog index skipped: no running event loop.")
@@ -711,6 +738,8 @@ async def run_auto_catalog_sync(db, *, force: bool = False, force_refresh: bool 
             await _write_status(db, summary)
             LOGGER.error(f"Auto catalog sync failed: {summary}")
             raise
+        finally:
+            await asyncio.to_thread(release_memory, "auto-catalog-finished")
 
 
 async def start_auto_catalog_sync_background(db, *, force_refresh: bool = False, force: bool = False, delay_seconds: int = 0) -> dict:
@@ -739,7 +768,7 @@ async def start_auto_catalog_sync_background(db, *, force_refresh: bool = False,
         except Exception:
             LOGGER.exception("Background auto catalog sync crashed")
 
-    _auto_sync_task = asyncio.create_task(runner())
+    _auto_sync_task = spawn(runner(), name="bg-auto-catalog-sync")
     return {
         "running": True,
         "message": "Sync started in background.",

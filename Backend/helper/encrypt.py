@@ -3,9 +3,10 @@ import json
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
-executor = ThreadPoolExecutor()
+executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="crypto")
 
 BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+CRYPTO_INLINE_THRESHOLD = 4096
 
 
 #----- zlib (de)compression
@@ -42,12 +43,20 @@ async def _run(fn, data):
 
 #----- Encode a JSON-serializable value into a compact base62 string
 async def encode_string(data):
-    compressed_data = await _run(compress_data, json.dumps(data))
+    json_str = json.dumps(data)
+    if len(json_str) < CRYPTO_INLINE_THRESHOLD:
+        compressed_data = compress_data(json_str)
+        return base62_encode(compressed_data)
+    compressed_data = await _run(compress_data, json_str)
     return await _run(base62_encode, compressed_data)
 
 
 #----- Decode a base62 string back into the original value
 async def decode_string(encoded_data):
+    if len(encoded_data) < CRYPTO_INLINE_THRESHOLD:
+        compressed_data = base62_decode(encoded_data)
+        json_data = decompress_data(compressed_data)
+        return json.loads(json_data)
     compressed_data = await _run(base62_decode, encoded_data)
     json_data = await _run(decompress_data, compressed_data)
     return json.loads(json_data)

@@ -1,4 +1,3 @@
-from asyncio import create_task
 from datetime import datetime
 
 from pyrogram.enums import ParseMode
@@ -6,6 +5,7 @@ from pyrogram.errors import FloodWait, MessageDeleteForbidden, MessageIdInvalid
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from Backend import db
+from Backend.helper.memory import spawn
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import StreamBot, get_streambot_url
@@ -126,7 +126,7 @@ async def _announce(info: dict) -> None:
 #----- Fire-and-forget announcement for a freshly added title
 def announce_new_media(info: dict) -> None:
     try:
-        create_task(_announce(dict(info)))
+        spawn(_announce(dict(info)), name="announce-new-media")
     except RuntimeError:
         LOGGER.warning("Announcement skipped: no running event loop.")
 
@@ -160,6 +160,6 @@ async def delete_announcement(media_type: str, tmdb_id) -> None:
 
 def delete_announcement_async(media_type: str, tmdb_id) -> None:
     try:
-        create_task(delete_announcement(media_type, tmdb_id))
+        spawn(delete_announcement(media_type, tmdb_id), name="delete-announcement")
     except RuntimeError:
         LOGGER.warning("Announcement delete skipped: no running event loop.")

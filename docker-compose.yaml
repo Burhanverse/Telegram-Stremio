@@ -6,6 +6,9 @@ services:
       - "8000:8000"
     volumes:
       - ./config.env:/app/config.env
+      - ./cache:/app/cache
+    mem_limit: ${MEM_LIMIT:-1g}
+    mem_reservation: ${MEM_RESERVATION:-512m}
     restart: unless-stopped
     logging:
       driver: "json-file"

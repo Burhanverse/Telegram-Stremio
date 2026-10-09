@@ -1,5 +1,7 @@
-from asyncio import Lock, Queue, create_task
+import asyncio
+from asyncio import Lock, Queue
 from asyncio import sleep as asleep
+from typing import Optional
 
 from pyrogram import Client, filters
 from pyrogram.enums.parse_mode import ParseMode
@@ -12,6 +14,7 @@ from Backend.helper.announcer import announce_new_media
 from Backend.helper.auto_catalog import start_single_media_catalog_sync
 from Backend.helper.encrypt import encode_string
 from Backend.helper.manual_add import resolve_telegram_message, stamp_caption_with_id
+from Backend.helper.memory import spawn
 from Backend.helper.requests_manager import auto_fulfill
 from Backend.helper.metadata import extract_default_id, metadata
 from Backend.helper.pyro import apply_video_thumb_to_metadata, clean_filename, finalize_media_name, get_readable_file_size, resolve_video_thumb_url
@@ -25,6 +28,7 @@ from Backend.logger import LOGGER
 file_queue = Queue()
 db_lock = Lock()
 manual_session_lock = Lock()
+_consumer_task: Optional[asyncio.Task] = None
 
 
 #----- True when the message carries a streamable video or a split-archive part
@@ -68,36 +72,73 @@ def _finalize_title(title: str, metadata_info: dict) -> str:
 async def process_file():
     while True:
         metadata_info, channel, msg_id, size, raw_size, title = await file_queue.get()
-        insert_status: dict = {}
-        async with db_lock:
-            updated_id = await db.insert_media(metadata_info, channel=channel, msg_id=msg_id, size=size, raw_size=raw_size, name=title, status=insert_status)
+        try:
+            insert_status: dict = {}
+            async with db_lock:
+                updated_id = await db.insert_media(
+                    metadata_info,
+                    channel=channel,
+                    msg_id=msg_id,
+                    size=size,
+                    raw_size=raw_size,
+                    name=title,
+                    status=insert_status,
+                )
+                if updated_id:
+                    LOGGER.info(f"{metadata_info['media_type']} updated with ID: {updated_id}")
+                else:
+                    LOGGER.info("Update failed due to validation errors.")
+
+            if updated_id and insert_status.get("duplicate_skipped"):
+                LOGGER.info(
+                    f"Duplicate protection: deleting duplicate message {msg_id} from channel {channel}."
+                )
+                spawn(delete_message(int(f"-100{channel}"), msg_id))
+                continue
+
             if updated_id:
-                LOGGER.info(f"{metadata_info['media_type']} updated with ID: {updated_id}")
-            else:
-                LOGGER.info("Update failed due to validation errors.")
-
-        if updated_id and insert_status.get("duplicate_skipped"):
-            LOGGER.info(f"Duplicate protection: deleting duplicate message {msg_id} from channel {channel}.")
-            create_task(delete_message(int(f"-100{channel}"), msg_id))
+                start_single_media_catalog_sync(
+                    db,
+                    tmdb_id=metadata_info.get("tmdb_id"),
+                    media_type=metadata_info.get("media_type"),
+                )
+                announce_new_media(metadata_info)
+                spawn(
+                    auto_fulfill(
+                        tmdb_id=metadata_info.get("tmdb_id"),
+                        imdb_id=metadata_info.get("imdb_id"),
+                        media_type=metadata_info.get("media_type"),
+                    )
+                )
+        except Exception:
+            LOGGER.exception("Error processing file in receiver consumer loop")
+        finally:
             file_queue.task_done()
-            continue
-
-        if updated_id:
-            start_single_media_catalog_sync(
-                db,
-                tmdb_id=metadata_info.get("tmdb_id"),
-                media_type=metadata_info.get("media_type"),
-            )
-            announce_new_media(metadata_info)
-            create_task(auto_fulfill(
-                tmdb_id=metadata_info.get("tmdb_id"),
-                imdb_id=metadata_info.get("imdb_id"),
-                media_type=metadata_info.get("media_type"),
-            ))
-        file_queue.task_done()
 
 
-create_task(process_file())
+async def _supervised_consumer():
+    while True:
+        try:
+            await process_file()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            LOGGER.exception(f"Receiver consumer crashed unexpectedly: {e}. Restarting in 1s...")
+            await asyncio.sleep(1)
+
+
+def start_receiver_consumer():
+    global _consumer_task
+    if _consumer_task is None or _consumer_task.done():
+        _consumer_task = spawn(_supervised_consumer(), name="receiver_file_queue_consumer")
+    return _consumer_task
+
+
+try:
+    asyncio.get_running_loop()
+    start_receiver_consumer()
+except RuntimeError:
+    pass
 
 
 #----- Build a title-level metadata base from an existing media document
@@ -195,7 +236,7 @@ async def _handle_personal_session(client: Client, message: Message) -> None:
             where = (f"S{metadata_info['season_number']:02d}E{metadata_info['episode_number']:02d} "
                      if media_type == "tv" else "")
             LOGGER.info(f"[Manual Session] Added {quality} {where}to '{metadata_info.get('title')}' (id {tmdb_id}).")
-            create_task(stamp_caption_with_id(message, metadata_info))
+            spawn(stamp_caption_with_id(message, metadata_info), name="stamp-caption")
         else:
             LOGGER.warning(f"[Manual Session] Insert failed for message {message.id}.")
 
@@ -230,7 +271,7 @@ async def file_receive_handler(client: Client, message: Message):
         sub_name = (message.document.file_name if message.document else "") or ""
         if sub_name and is_subtitle_file(sub_name):
             channel = str(message.chat.id).replace("-100", "")
-            create_task(ingest_subtitle(sub_name, int(channel), message.id))
+            spawn(ingest_subtitle(sub_name, int(channel), message.id), name="ingest-subtitle")
             return
 
         if not _is_supported_media(message):
@@ -249,10 +290,11 @@ async def file_receive_handler(client: Client, message: Message):
         encoded = metadata_info.get("encoded_string") or await encode_string({"chat_id": int(channel), "msg_id": msg_id})
         await apply_video_thumb_to_metadata(metadata_info, message, encoded, client)
 
+        start_receiver_consumer()
         await file_queue.put((metadata_info, int(channel), msg_id, size, raw_size, title))
 
         if is_real_session:
-            create_task(stamp_caption_with_id(message, metadata_info))
+            spawn(stamp_caption_with_id(message, metadata_info))
     except FloodWait as e:
         LOGGER.info(f"Sleeping for {str(e.value)}s")
         await asleep(e.value)
@@ -301,6 +343,7 @@ async def file_edited_handler(client: Client, message: Message):
         title = _finalize_title(title, metadata_info)
         encoded = metadata_info.get("encoded_string") or await encode_string({"chat_id": int(channel), "msg_id": msg_id})
         await apply_video_thumb_to_metadata(metadata_info, message, encoded, client)
+        start_receiver_consumer()
         await file_queue.put((metadata_info, int(channel), msg_id, size, raw_size, title))
     except Exception as e:
         LOGGER.error(f"Error handling edited generic file {message.id}: {e}")

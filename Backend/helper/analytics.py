@@ -3,14 +3,16 @@ from datetime import datetime, timedelta
 
 import httpx
 
+from cachetools import TTLCache
+
 from Backend import db
 from Backend.helper.custom_dl import ACTIVE_STREAMS
 from Backend.logger import LOGGER
 
-_IP_CACHE = {}
 _IP_TTL = 6 * 3600
-_LAST_FULL = {}
+_IP_CACHE: TTLCache = TTLCache(maxsize=5000, ttl=_IP_TTL)
 _FULL_INTERVAL = 60
+_LAST_FULL: TTLCache = TTLCache(maxsize=5000, ttl=300)
 ONLINE_WINDOW = 120
 
 #----- App/device parsed from the ADDON-PROTOCOL User-Agent (manifest/stream requests),

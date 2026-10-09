@@ -27,9 +27,10 @@ from Backend.helper.auto_catalog import (
     update_auto_catalog_settings,
 )
 from Backend.helper.backup import export_config, import_config
-from Backend.helper.custom_dl import ByteStreamer, _speed_test_single_client, run_speed_test
+from Backend.helper.custom_dl import ByteStreamer, _speed_test_single_client, get_streamer, run_speed_test
 from Backend.helper.encrypt import decode_string, encode_string
 from Backend.helper.health import run_health_checks
+from Backend.helper.memory import spawn
 from Backend.helper.manual_add import resolve_telegram_message, stamp_caption_by_ref
 from Backend.helper.pyro import resolve_video_thumb_url
 from Backend.helper.requests_manager import (
@@ -488,8 +489,9 @@ async def speed_test_stream_api(
         #----- Resolve the FileId to report the target DC
         target_dc = "?"
         try:
-            primary_client = multi_clients.get(0) or next(iter(multi_clients.values()))
-            streamer = ByteStreamer(primary_client)
+            primary_idx = 0 if 0 in multi_clients else next(iter(multi_clients.keys()))
+            primary_client = multi_clients[primary_idx]
+            streamer = get_streamer(primary_client, primary_idx)
             file_id = await streamer.get_file_properties(chat_id, int(msg_id))
             target_dc = file_id.dc_id
         except Exception:
@@ -511,7 +513,7 @@ async def speed_test_stream_api(
             await queue.put({"type": "result", "data": result})
 
         tasks = [
-            asyncio.create_task(run_one(client, idx))
+            spawn(run_one(client, idx), name=f"speed-test-{idx}")
             for idx, client in multi_clients.items()
         ]
 
@@ -579,14 +581,44 @@ async def get_admin_stats_api() -> dict:
     }
 
 
-#----- Clear the FileId cache across all active streamers
+#----- Memory diagnostics
+async def get_mem_stats_api() -> dict:
+    from Backend.helper.memory import get_tracemalloc_diff, is_tracemalloc_enabled, mem_stats
+    stats = mem_stats()
+    result = {"status": "success", "data": stats}
+    if is_tracemalloc_enabled():
+        result["tracemalloc_diff"] = get_tracemalloc_diff(25)
+    return result
+
+
+#----- Clear the FileId cache across all active streamers and metadata caches
 async def clear_cache_api() -> dict:
     total_cleared = sum(len(s._file_id_cache) for s in _streamer_by_client.values())
     for streamer in _streamer_by_client.values():
         streamer._file_id_cache.clear()
-    LOGGER.info(f"Admin cleared the FileId cache ({total_cleared} items purged across {len(_streamer_by_client)} clients).")
 
-    return {"status": "success", "message": f"{total_cleared} cached items cleared."}
+    from Backend.helper.metadata.common import clear_metadata_caches
+    meta_cleared = await clear_metadata_caches()
+
+    from Backend.fastapi.routes.stream_routes import clear_thumb_caches
+    thumb_cleared = await clear_thumb_caches()
+
+    LOGGER.info(
+        f"Admin cleared the FileId cache ({total_cleared} items purged across {len(_streamer_by_client)} clients), "
+        f"metadata caches ({meta_cleared['ram_cleared']} RAM items, {meta_cleared['disk_cleared']} disk items), "
+        f"and thumbnail caches ({thumb_cleared['ram_cleared']} RAM items, {thumb_cleared['disk_cleared']} disk items)."
+    )
+
+    return {
+        "status": "success",
+        "message": (
+            f"{total_cleared} file items, "
+            f"{meta_cleared['ram_cleared']} RAM metadata items, "
+            f"{meta_cleared['disk_cleared']} disk metadata items, "
+            f"{thumb_cleared['ram_cleared']} RAM thumb items, "
+            f"{thumb_cleared['disk_cleared']} disk thumb items cleared."
+        ),
+    }
 
 
 #----- List dead links recorded in the DB
@@ -2467,7 +2499,7 @@ async def _perform_restart(delay: float = 1.0) -> None:
 
 #----- Trigger a restart from the web (was /restart)
 async def restart_app_api() -> dict:
-    asyncio.create_task(_perform_restart())
+    spawn(_perform_restart(), name="admin-restart")
     return {"status": "success", "message": "Restart initiated — the server will be back shortly."}
 
 
@@ -2810,8 +2842,9 @@ async def bot_admin_apply_api(payload: dict | None = None) -> dict:
         "results": [],
         "error": "",
     })
-    _bot_admin_apply_state["task"] = asyncio.create_task(
-        _run_bot_admin_apply(channel_ids, selected, demote_orphans, managed_ids)
+    _bot_admin_apply_state["task"] = spawn(
+        _run_bot_admin_apply(channel_ids, selected, demote_orphans, managed_ids),
+        name="bot-admin-apply",
     )
     return {"status": "started", "total": len(channel_ids)}
 

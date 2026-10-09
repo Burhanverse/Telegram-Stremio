@@ -14,3 +14,5 @@ uvicorn
 uv
 uvloop
 httptools
+cachetools
+diskcache

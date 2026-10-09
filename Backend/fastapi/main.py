@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from Backend import __version__
+from Backend.helper.memory import spawn
 from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_theme
 from Backend.fastapi.routes.api_routes import (
     add_custom_catalog_item_api,
@@ -41,6 +42,7 @@ from Backend.fastapi.routes.api_routes import (
     delete_tv_season_api,
     download_logs_api,
     get_admin_stats_api,
+    get_mem_stats_api,
     get_db_stats_api,
     get_all_subscribers_api,
     get_all_tokens_api,
@@ -164,9 +166,11 @@ except Exception:
 
 @app.on_event("startup")
 async def _startup():
-    asyncio.create_task(decay_client_failures())
+    spawn(decay_client_failures(), name="decay-client-failures")
     from Backend.helper.version_check import version_check_loop
-    asyncio.create_task(version_check_loop())
+    spawn(version_check_loop(), name="version-check-loop")
+    from Backend.helper.metadata.common import start_metadata_cache_maintenance
+    start_metadata_cache_maintenance()
 
 
 #----- Streaming and Stremio routers
@@ -368,6 +372,10 @@ async def get_system_stats(_: bool = Depends(require_auth)):
 @app.get("/api/admin/system-stats")
 async def admin_system_stats(_: bool = Depends(require_auth)):
     return await get_admin_stats_api()
+
+@app.get("/api/admin/mem-stats")
+async def admin_mem_stats(_: bool = Depends(require_auth)):
+    return await get_mem_stats_api()
 
 @app.post("/api/admin/clear-cache")
 async def clear_cache(_: bool = Depends(require_auth)):

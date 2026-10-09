@@ -3,6 +3,7 @@ import asyncio
 from pyrogram.errors import FloodWait
 
 from Backend.helper.encrypt import decode_string
+from Backend.helper.memory import release_memory, spawn
 from Backend.helper.pyro import is_media
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import multi_clients
@@ -23,7 +24,7 @@ class DeadLinkChecker:
             return
         self.is_running = True
         LOGGER.info(f"Started Dead Link Checker background task (Interval: {self.check_interval_seconds}s)")
-        asyncio.create_task(self._run_loop())
+        spawn(self._run_loop(), name="dead-link-checker")
 
     async def _run_loop(self):
         await asyncio.sleep(120)
@@ -35,6 +36,8 @@ class DeadLinkChecker:
                 LOGGER.info("Dead Link Checker scan complete.")
             except Exception as e:
                 LOGGER.error(f"Error in Dead Link Checker loop: {e}")
+            finally:
+                await asyncio.to_thread(release_memory, "link-checker-finished")
 
             await asyncio.sleep(self.check_interval_seconds)
 
@@ -50,12 +53,13 @@ class DeadLinkChecker:
 
             #----- Movies (snapshot ids first so no cursor stays open during the slow Telegram checks)
             try:
-                movie_ids = [d["_id"] for d in await active_db["movie"].find(
+                movie_ids = [d["_id"] async for d in active_db["movie"].find(
                     {"telegram": {"$exists": True, "$not": {"$size": 0}}, "telegram.is_dead": {"$ne": True}},
                     {"_id": 1},
-                ).to_list(None)]
+                )]
+                movie_proj = {"tmdb_id": 1, "telegram": 1}
                 for movie_id in movie_ids:
-                    movie = await active_db["movie"].find_one({"_id": movie_id})
+                    movie = await active_db["movie"].find_one({"_id": movie_id}, movie_proj)
                     if not movie:
                         continue
                     tmdb_id = movie.get("tmdb_id")
@@ -72,12 +76,18 @@ class DeadLinkChecker:
 
             #----- TV Shows (snapshot ids first, then re-read each doc with a short query)
             try:
-                tv_ids = [d["_id"] for d in await active_db["tv"].find(
+                tv_ids = [d["_id"] async for d in active_db["tv"].find(
                     {"seasons.episodes.telegram": {"$exists": True, "$not": {"$size": 0}}, "seasons.episodes.telegram.is_dead": {"$ne": True}},
                     {"_id": 1},
-                ).to_list(None)]
+                )]
+                tv_proj = {
+                    "tmdb_id": 1,
+                    "seasons.season_number": 1,
+                    "seasons.episodes.episode_number": 1,
+                    "seasons.episodes.telegram": 1,
+                }
                 for tv_id in tv_ids:
-                    tv = await active_db["tv"].find_one({"_id": tv_id})
+                    tv = await active_db["tv"].find_one({"_id": tv_id}, tv_proj)
                     if not tv:
                         continue
                     tmdb_id = tv.get("tmdb_id")

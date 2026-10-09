@@ -5,6 +5,10 @@ ENV PYTHONUNBUFFERED=1
 ENV LANG=en_US.UTF-8
 ENV PATH="/app/.venv/bin:$PATH"
 
+# Allocator hardening (glibc)
+ENV MALLOC_ARENA_MAX=2
+ENV MALLOC_TRIM_THRESHOLD_=131072
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \

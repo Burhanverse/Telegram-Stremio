@@ -4,6 +4,7 @@ from typing import Optional
 from pyrogram import Client
 
 from Backend import db
+from Backend.helper.memory import spawn
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import get_streambot_url
@@ -76,7 +77,7 @@ async def start(bot) -> bool:
     global _task
     if is_running():
         return False
-    _task = asyncio.create_task(subscription_checker_loop(bot))
+    _task = spawn(subscription_checker_loop(bot), name="subscription-checker")
     LOGGER.info("Subscription Checker Task Started.")
     return True
 

@@ -1,9 +1,10 @@
-from asyncio import create_task, gather
+from asyncio import gather
 
 from pyrogram import Client
 
 from Backend.config import Telegram
-from Backend.fastapi.routes.stream_routes import _streamer_by_client
+from Backend.helper.custom_dl import close_streamer_for_client
+from Backend.helper.memory import spawn
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import StreamBot, client_dc_map, multi_clients, work_loads
@@ -54,7 +55,7 @@ async def stop_client(client_id: int) -> None:
     work_loads.pop(client_id, None)
     client_dc_map.pop(client_id, None)
     client_tokens.pop(client_id, None)
-    _streamer_by_client.pop(client_id, None)
+    await close_streamer_for_client(client, client_id)
 
     if client:
         try:
@@ -81,7 +82,7 @@ async def initialize_clients() -> None:
         LOGGER.info("No additional Bot Clients found, Using default client")
         return
 
-    tasks = [create_task(start_client(i, token)) for i, token in all_tokens.items()]
+    tasks = [spawn(start_client(i, token), name=f"start-client-{i}") for i, token in all_tokens.items()]
     results = await gather(*tasks)
 
     started = {client_id: client for client_id, client in results if client}
@@ -110,7 +111,7 @@ async def reload_multi_token_clients() -> dict:
     to_start = {cid: tok for cid, tok in new_tokens.items() if cid not in old_ids or client_tokens.get(cid) != tok}
 
     if to_start:
-        tasks = [create_task(start_client(cid, tok)) for cid, tok in to_start.items()]
+        tasks = [spawn(start_client(cid, tok), name=f"reload-client-{cid}") for cid, tok in to_start.items()]
         results = await gather(*tasks)
         started = {cid: client for cid, client in results if client}
         multi_clients.update(started)

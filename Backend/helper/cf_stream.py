@@ -5,6 +5,7 @@ import time
 
 import httpx
 
+from Backend.helper.memory import spawn
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 
@@ -66,4 +67,4 @@ async def notify_worker() -> None:
 
 #----- Fire-and-forget: never delays the save or login that triggered it
 def sync_worker_soon() -> None:
-    asyncio.create_task(notify_worker())
+    spawn(notify_worker(), name="cf-notify-worker")
