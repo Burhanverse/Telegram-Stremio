@@ -4,9 +4,12 @@ from __future__ import annotations
 import asyncio
 import re
 from difflib import SequenceMatcher
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
+import diskcache
+from cachetools import TTLCache
 from rapidfuzz import fuzz
 
 from Backend.logger import LOGGER
@@ -27,44 +30,229 @@ GRADIENT_COVER_BASE = "https://gradient-cover-api.vercel.app"
 
 API_SEMAPHORE = asyncio.Semaphore(12)
 
-# Shared caches (provider modules may also keep their own)
-IMDB_CACHE: dict = {}
-TMDB_SEARCH_CACHE: dict = {}
-TMDB_DETAILS_CACHE: dict = {}
-EPISODE_CACHE: dict = {}
-ALT_TITLES_CACHE: dict = {}
-TVDB_CACHE: dict = {}
-KITSU_CACHE: dict = {}
+# Two-tier cache configuration
+METADATA_RAM_CACHE_SIZE = int(os.getenv("METADATA_RAM_CACHE_SIZE", "512"))
+METADATA_RAM_CACHE_TTL = int(os.getenv("METADATA_RAM_CACHE_TTL", "3600"))
+
+_raw_ttl_days_env = os.getenv("METADATA_CACHE_TTL_DAYS")
+if _raw_ttl_days_env is not None:
+    _raw_ttl_days_val = int(_raw_ttl_days_env)
+elif os.getenv("METADATA_CACHE_TTL"):
+    _raw_ttl_days_val = max(1, int(os.getenv("METADATA_CACHE_TTL")) // 86400)
+else:
+    _raw_ttl_days_val = 7
+
+if _raw_ttl_days_val < 3:
+    LOGGER.warning(
+        f"[MetadataCache] METADATA_CACHE_TTL_DAYS={_raw_ttl_days_val} is below minimum (3 days). Clamping to 3."
+    )
+    METADATA_CACHE_TTL_DAYS = 3
+else:
+    METADATA_CACHE_TTL_DAYS = _raw_ttl_days_val
+
+METADATA_DISK_CACHE_TTL = METADATA_CACHE_TTL_DAYS * 86400
+METADATA_NEGATIVE_CACHE_TTL = int(os.getenv("METADATA_NEGATIVE_CACHE_TTL", "3600"))
+METADATA_CACHE_SIZE_MB = int(os.getenv("METADATA_CACHE_SIZE_MB", "10240"))
+
+_default_cache_dir = os.getenv("METADATA_CACHE_DIR", "/app/cache/metadata")
+try:
+    os.makedirs(_default_cache_dir, exist_ok=True)
+except (PermissionError, OSError):
+    _default_cache_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+        "cache",
+        "metadata",
+    )
+    os.makedirs(_default_cache_dir, exist_ok=True)
+
+METADATA_CACHE_DIR = _default_cache_dir
+
+_disk_cache: Optional[diskcache.Cache] = None
+try:
+    _disk_cache = diskcache.Cache(
+        METADATA_CACHE_DIR,
+        size_limit=METADATA_CACHE_SIZE_MB * 1024 * 1024,
+    )
+except Exception as e:
+    LOGGER.error(f"[MetadataCache] Failed to initialize diskcache at {METADATA_CACHE_DIR}: {e}")
+
+# Shared in-RAM caches (LRU / TTL front tier)
+IMDB_CACHE: TTLCache = TTLCache(maxsize=METADATA_RAM_CACHE_SIZE, ttl=METADATA_RAM_CACHE_TTL)
+TMDB_SEARCH_CACHE: TTLCache = TTLCache(maxsize=METADATA_RAM_CACHE_SIZE, ttl=METADATA_RAM_CACHE_TTL)
+TMDB_DETAILS_CACHE: TTLCache = TTLCache(maxsize=METADATA_RAM_CACHE_SIZE, ttl=METADATA_RAM_CACHE_TTL)
+EPISODE_CACHE: TTLCache = TTLCache(maxsize=METADATA_RAM_CACHE_SIZE, ttl=METADATA_RAM_CACHE_TTL)
+ALT_TITLES_CACHE: TTLCache = TTLCache(maxsize=METADATA_RAM_CACHE_SIZE, ttl=METADATA_RAM_CACHE_TTL)
+TVDB_CACHE: TTLCache = TTLCache(maxsize=METADATA_RAM_CACHE_SIZE, ttl=METADATA_RAM_CACHE_TTL)
+KITSU_CACHE: TTLCache = TTLCache(maxsize=METADATA_RAM_CACHE_SIZE, ttl=METADATA_RAM_CACHE_TTL)
 
 _INFLIGHT: Dict[tuple, asyncio.Future] = {}
+_DISK_MISS = object()
+
+
+def _normalize_key(key: Any) -> Any:
+    if isinstance(key, list):
+        return tuple(_normalize_key(x) for x in key)
+    if isinstance(key, tuple):
+        return tuple(_normalize_key(x) for x in key)
+    return key
+
+
+def _is_empty_or_failed(result: Any) -> bool:
+    if result is None:
+        return True
+    if result == {} or result == []:
+        return True
+    return False
+
+
+def get_disk_cache_stats() -> dict:
+    if _disk_cache is None:
+        return {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": METADATA_CACHE_SIZE_MB}
+    try:
+        vol = _disk_cache.volume()
+        return {
+            "items": len(_disk_cache),
+            "size_bytes": vol,
+            "size_mb": round(vol / (1024 * 1024), 2),
+            "size_limit_mb": METADATA_CACHE_SIZE_MB,
+        }
+    except Exception:
+        return {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": METADATA_CACHE_SIZE_MB}
+
+
+def clear_metadata_ram_caches() -> int:
+    caches = [
+        IMDB_CACHE,
+        TMDB_SEARCH_CACHE,
+        TMDB_DETAILS_CACHE,
+        EPISODE_CACHE,
+        ALT_TITLES_CACHE,
+        TVDB_CACHE,
+        KITSU_CACHE,
+    ]
+    total = sum(len(c) for c in caches)
+    for c in caches:
+        c.clear()
+    return total
+
+
+async def clear_metadata_caches() -> dict:
+    ram_count = clear_metadata_ram_caches()
+    disk_count = 0
+    if _disk_cache is not None:
+        try:
+            disk_count = len(_disk_cache)
+            await asyncio.to_thread(_disk_cache.clear)
+        except Exception as e:
+            LOGGER.warning(f"[MetadataCache] Error clearing disk cache: {e}")
+    return {"ram_cleared": ram_count, "disk_cleared": disk_count}
+
+
+class _OwnerCancelled(BaseException):
+    """Raised on in-flight future when the owner task is cancelled, allowing waiters to retry."""
+    pass
+
+
+async def cached_call(store: dict, key, ns: str, producer):
+    norm_key = _normalize_key(key)
+    if norm_key in store:
+        return store[norm_key]
+
+    disk_key = (ns, norm_key)
+    if _disk_cache is not None:
+        try:
+            cached_val = await asyncio.to_thread(_disk_cache.get, disk_key, default=_DISK_MISS)
+            if cached_val is not _DISK_MISS:
+                if not _is_empty_or_failed(cached_val):
+                    store[norm_key] = cached_val
+                return cached_val
+        except Exception as e:
+            LOGGER.warning(f"[MetadataCache] Disk cache read error for {disk_key}: {e}")
+
+    flight_key = (ns, norm_key)
+    fut = _INFLIGHT.get(flight_key)
+    if fut is not None:
+        try:
+            return await fut
+        except _OwnerCancelled:
+            return await cached_call(store, key, ns, producer)
+
+    fut = asyncio.get_running_loop().create_future()
+    _INFLIGHT[flight_key] = fut
+
+    try:
+        try:
+            result = await producer()
+        except asyncio.CancelledError as ce:
+            if not fut.done():
+                fut.set_exception(_OwnerCancelled("Producer cancelled; retrying"))
+                try:
+                    fut.exception()
+                except Exception:
+                    pass
+            raise ce
+        except BaseException as be:
+            if not fut.done():
+                fut.set_exception(be)
+                try:
+                    fut.exception()
+                except Exception:
+                    pass
+            raise be
+        else:
+            if not fut.done():
+                fut.set_result(result)
+
+            if not _is_empty_or_failed(result):
+                store[norm_key] = result
+
+            if _disk_cache is not None:
+                expire = (
+                    METADATA_NEGATIVE_CACHE_TTL
+                    if _is_empty_or_failed(result)
+                    else METADATA_DISK_CACHE_TTL
+                )
+                try:
+                    await asyncio.to_thread(_disk_cache.set, disk_key, result, expire=expire)
+                except Exception as de:
+                    LOGGER.warning(f"[MetadataCache] Disk cache write error for {disk_key}: {de}")
+
+            return result
+    finally:
+        _INFLIGHT.pop(flight_key, None)
+
+
+async def _metadata_cache_maintenance_loop():
+    while True:
+        if _disk_cache is not None:
+            try:
+                await asyncio.to_thread(_disk_cache.expire)
+            except Exception as e:
+                LOGGER.warning(f"[MetadataCache] Error during disk cache expiration: {e}")
+        await asyncio.sleep(86400)
+
+
+_maintenance_task: Optional[asyncio.Task] = None
+
+
+def start_metadata_cache_maintenance() -> Optional[asyncio.Task]:
+    global _maintenance_task
+    if _disk_cache is None:
+        return None
+    if _maintenance_task is not None and not _maintenance_task.done():
+        return _maintenance_task
+    try:
+        from Backend.helper.memory import spawn
+        _maintenance_task = spawn(_metadata_cache_maintenance_loop(), name="metadata-cache-expire")
+        return _maintenance_task
+    except Exception as e:
+        LOGGER.warning(f"[MetadataCache] Could not start maintenance task: {e}")
+        return None
+
 
 _APOSTROPHE_RE = re.compile(r"['\u2018\u2019`\u00B4]")
 _SYMBOL_STRIP_RE = re.compile(r"[&.\-:]+")
 _HTML_RE = re.compile(r"<[^>]+>")
-
-
-async def cached_call(store: dict, key, ns: str, producer):
-    if key in store:
-        return store[key]
-    flight_key = (ns, key)
-    fut = _INFLIGHT.get(flight_key)
-    if fut is not None:
-        return await fut
-    fut = asyncio.get_running_loop().create_future()
-    _INFLIGHT[flight_key] = fut
-    try:
-        result = await producer()
-    except Exception as e:
-        _INFLIGHT.pop(flight_key, None)
-        if not fut.done():
-            fut.set_exception(e)
-            fut.exception()
-        raise
-    store[key] = result
-    _INFLIGHT.pop(flight_key, None)
-    if not fut.done():
-        fut.set_result(result)
-    return result
 
 
 def strip_html(text: str) -> str:

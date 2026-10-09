@@ -11,6 +11,7 @@ from Backend.fastapi import server
 from Backend.fastapi.main import app
 from Backend.helper import subscription_task_manager
 from Backend.helper.link_checker import DeadLinkChecker
+from Backend.helper.memory import cancel_all_tracked_tasks, spawn, start_memory_watchdog
 from Backend.helper.pinger import ping
 from Backend.helper.pyro import restart_notification, setup_bot_commands
 from Backend.helper.scan_manager import dbcheck_manager, duplicate_manager, scan_manager
@@ -73,13 +74,16 @@ async def start_services():
 
         LOGGER.info('Initializing Telegram-Stremio Web Server...')
         await restart_notification()
-        loop.create_task(server.serve())
-        loop.create_task(ping())
+        spawn(server.serve(), name="uvicorn-server")
+        spawn(ping(), name="pinger")
 
         link_checker_task = DeadLinkChecker(db, app, check_interval_hours=24)
-        loop.create_task(link_checker_task.start())
+        spawn(link_checker_task.start(), name="link-checker")
 
         await subscription_task_manager.sync(StreamBot)
+        start_memory_watchdog()
+        from Backend.helper.metadata.common import start_metadata_cache_maintenance
+        start_metadata_cache_maintenance()
 
         LOGGER.info("Telegram-Stremio Started Successfully!")
         await idle()
@@ -92,6 +96,7 @@ async def stop_services():
     try:
         LOGGER.info("Stopping services...")
 
+        await cancel_all_tracked_tasks()
         pending_tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in pending_tasks:
             task.cancel()

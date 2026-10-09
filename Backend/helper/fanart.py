@@ -6,7 +6,10 @@ from urllib.parse import quote
 
 import httpx
 
+from cachetools import TTLCache
+
 from Backend.helper.metadata import tmdb_api_key
+from Backend.helper.memory import spawn
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 
@@ -37,7 +40,7 @@ _CACHE_TTL = 6 * 3600
 _ERROR_TTL = 300
 _CACHE_MAX = 4096
 _cache: dict = {}
-_tvdb_cache: dict = {}
+_tvdb_cache: TTLCache = TTLCache(maxsize=2000, ttl=86400)
 _inflight: dict = {}
 
 _client: Optional[httpx.AsyncClient] = None
@@ -81,10 +84,14 @@ async def _fetch(url: str, params: dict) -> dict:
         return cached[1]
     task = _inflight.get(url)
     if task is None:
-        task = asyncio.create_task(_fetch_remote(url, params))
+        task = spawn(_fetch_remote(url, params), name=f"fanart_{url[:30]}")
         _inflight[url] = task
         task.add_done_callback(lambda _t, _u=url: _inflight.pop(_u, None))
-    return await task
+    try:
+        return await task
+    except asyncio.CancelledError:
+        _inflight.pop(url, None)
+        raise
 
 
 async def _resolve_tvdb(tmdb_id) -> Optional[int]:

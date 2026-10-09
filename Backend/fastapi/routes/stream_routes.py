@@ -1,22 +1,26 @@
 import asyncio
 import math
 import mimetypes
+import os
 import secrets
 import time
 from collections import deque
-from typing import Dict
+from typing import Dict, Optional
 from urllib.parse import quote, unquote
 
+import diskcache
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response as PlainResponse
 from fastapi.responses import StreamingResponse
+from cachetools import TTLCache
 
 from Backend import db
 from Backend.fastapi.security.tokens import verify_token
 from Backend.helper.analytics import client_ip_from, record_stream_start
-from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS, ByteStreamer
+from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS, ByteStreamer, _streamer_by_client, get_streamer
 from Backend.helper.encrypt import decode_string
+from Backend.helper.memory import spawn
 from Backend.helper.pyro import get_thumb_download_target
 from Backend.helper.utils import track_usage
 from Backend.helper.virtual_dl import resolve_virtual_parts, virtual_stream_generator
@@ -33,11 +37,10 @@ from Backend.pyrofork.bot import (
 
 router = APIRouter(tags=["Streaming"])
 
-_streamer_by_client: Dict = {}
 _rr_counter: int = 0
 
-_title_cache: Dict[str, tuple] = {}
 _TITLE_CACHE_TTL = 300
+_title_cache: TTLCache = TTLCache(maxsize=2000, ttl=_TITLE_CACHE_TTL)
 
 
 #----- Recursively convert non-JSON-native containers to serializable forms
@@ -122,9 +125,7 @@ def get_parallel_prefetch(client_count: int) -> tuple[int, int]:
 
 #----- Reuse (or lazily create) the cached ByteStreamer for a client index
 def _get_streamer(tg_client, index: int) -> ByteStreamer:
-    if tg_client not in _streamer_by_client:
-        _streamer_by_client[tg_client] = ByteStreamer(tg_client, index)
-    return _streamer_by_client[tg_client]
+    return get_streamer(tg_client, index)
 
 
 #----- Resolve a stream title from the TTL cache, DB, or the decoded URL name
@@ -172,41 +173,125 @@ def _build_stream_headers(mime_type, file_name, req_length, range_header, start,
     return headers, status
 
 
-_thumb_cache: Dict[str, tuple] = {}
-_THUMB_CACHE_TTL = 3600
+THUMB_CACHE_SIZE_MB = int(os.getenv("THUMB_CACHE_SIZE_MB", "2048"))
+THUMB_DISK_CACHE_TTL = 7 * 86400  # 7 days
+
+_default_thumb_cache_dir = os.getenv("THUMB_CACHE_DIR", "/app/cache/thumbs")
+try:
+    os.makedirs(_default_thumb_cache_dir, exist_ok=True)
+except (PermissionError, OSError):
+    _default_thumb_cache_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+        "cache",
+        "thumbs",
+    )
+    os.makedirs(_default_thumb_cache_dir, exist_ok=True)
+
+THUMB_CACHE_DIR = _default_thumb_cache_dir
+
+_thumb_disk_cache: Optional[diskcache.Cache] = None
+try:
+    _thumb_disk_cache = diskcache.Cache(
+        THUMB_CACHE_DIR,
+        size_limit=THUMB_CACHE_SIZE_MB * 1024 * 1024,
+    )
+except Exception as e:
+    LOGGER.error(f"[ThumbCache] Failed to initialize diskcache at {THUMB_CACHE_DIR}: {e}")
+
+_THUMB_RAM_CACHE_SIZE_BYTES = 8 * 1024 * 1024  # ~8 MB RAM front
+_THUMB_RAM_CACHE_TTL = 3600
+
+
+def _thumb_ram_sizeof(v):
+    raw = v[0] if isinstance(v, (tuple, list)) and len(v) > 0 else v
+    if isinstance(raw, (bytes, bytearray)):
+        return len(raw)
+    return 1
+
+
+_thumb_cache: TTLCache = TTLCache(
+    maxsize=_THUMB_RAM_CACHE_SIZE_BYTES,
+    ttl=_THUMB_RAM_CACHE_TTL,
+    getsizeof=_thumb_ram_sizeof,
+)
+
+
+def get_thumb_disk_cache_stats() -> dict:
+    if _thumb_disk_cache is None:
+        return {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": THUMB_CACHE_SIZE_MB}
+    try:
+        vol = _thumb_disk_cache.volume()
+        return {
+            "items": len(_thumb_disk_cache),
+            "size_bytes": vol,
+            "size_mb": round(vol / (1024 * 1024), 2),
+            "size_limit_mb": THUMB_CACHE_SIZE_MB,
+        }
+    except Exception:
+        return {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": THUMB_CACHE_SIZE_MB}
+
+
+async def clear_thumb_caches() -> dict:
+    ram_count = len(_thumb_cache)
+    _thumb_cache.clear()
+    disk_count = 0
+    if _thumb_disk_cache is not None:
+        try:
+            disk_count = len(_thumb_disk_cache)
+            await asyncio.to_thread(_thumb_disk_cache.clear)
+        except Exception as e:
+            LOGGER.warning(f"[ThumbCache] Error clearing disk cache: {e}")
+    return {"ram_cleared": ram_count, "disk_cleared": disk_count}
 
 
 #----- Serve a Telegram video/document thumbnail (public, used as artwork)
 @router.get("/thumb/{id}")
 async def thumb_handler(id: str):
-    now = time.time()
     cached = _thumb_cache.get(id)
-    if cached and now < cached[1]:
-        data = cached[0]
+    if cached is not None:
+        data = cached[0] if isinstance(cached, (tuple, list)) and len(cached) > 0 else cached
     else:
-        try:
-            decoded = await decode_string(id)
-            chat_id = int(f"-100{decoded['chat_id']}")
-            msg_id = int(decoded["msg_id"])
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid thumbnail id")
-        if not multi_clients:
-            raise HTTPException(status_code=503, detail="No client available")
-        client = multi_clients[select_best_client(0)]
-        try:
-            message = await client.get_messages(chat_id, msg_id)
-            target = get_thumb_download_target(message)
-            if not target:
-                raise HTTPException(status_code=404, detail="No thumbnail")
-            file_id = getattr(target, "file_id", None) or target
-            buf = await client.download_media(file_id, in_memory=True)
-            data = buf.getvalue()
-        except HTTPException:
-            raise
-        except Exception as e:
-            LOGGER.warning(f"[THUMB] fetch failed for {id}: {e}")
-            raise HTTPException(status_code=404, detail="Thumbnail unavailable")
-        _thumb_cache[id] = (data, now + _THUMB_CACHE_TTL)
+        data = None
+        if _thumb_disk_cache is not None:
+            try:
+                data = await asyncio.to_thread(_thumb_disk_cache.get, id)
+                if data is not None:
+                    _thumb_cache[id] = data
+            except Exception as e:
+                LOGGER.warning(f"[ThumbCache] Disk cache read error for {id}: {e}")
+
+        if data is None:
+            try:
+                decoded = await decode_string(id)
+                chat_id = int(f"-100{decoded['chat_id']}")
+                msg_id = int(decoded["msg_id"])
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid thumbnail id")
+            if not multi_clients:
+                raise HTTPException(status_code=503, detail="No client available")
+            client = multi_clients[select_best_client(0)]
+            try:
+                message = await client.get_messages(chat_id, msg_id)
+                target = get_thumb_download_target(message)
+                if not target:
+                    raise HTTPException(status_code=404, detail="No thumbnail")
+                file_id = getattr(target, "file_id", None) or target
+                buf = await client.download_media(file_id, in_memory=True)
+                data = buf.getvalue()
+            except HTTPException:
+                raise
+            except Exception as e:
+                LOGGER.warning(f"[THUMB] fetch failed for {id}: {e}")
+                raise HTTPException(status_code=404, detail="Thumbnail unavailable")
+
+            if _thumb_disk_cache is not None:
+                try:
+                    await asyncio.to_thread(
+                        _thumb_disk_cache.set, id, data, expire=THUMB_DISK_CACHE_TTL
+                    )
+                except Exception as de:
+                    LOGGER.warning(f"[ThumbCache] Disk cache write error for {id}: {de}")
+            _thumb_cache[id] = data
 
     return PlainResponse(
         content=data,
@@ -259,12 +344,12 @@ async def subtitle_handler(token: str, id: str, name: str, token_data: dict = De
 @router.head("/dl/{token}/{id}/{name}")
 async def stream_handler(request: Request, token: str, id: str, name: str, token_data: dict = Depends(verify_token)):
     if request.method != "HEAD":
-        asyncio.create_task(record_stream_start(
+        spawn(record_stream_start(
             token,
             token_data.get("name") if token_data else None,
             client_ip_from(request),
             request.headers.get("user-agent", ""),
-        ))
+        ), name="record_stream_start")
     decoded = await decode_string(id)
 
     if decoded.get("global"):
@@ -369,7 +454,7 @@ async def media_streamer(request: Request, chat_id: int, msg_id: int, token: str
         extra_clients=extra_clients_for_stream,
     )
 
-    asyncio.create_task(track_usage(stream_id, token, token_data))
+    spawn(track_usage(stream_id, token, token_data), name="track_usage")
 
     headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
 
@@ -410,7 +495,7 @@ async def virtual_media_streamer(request: Request, parts_payload: list, token: s
     token_count = len(multi_clients) - 1
     parallelism, prefetch_count = get_parallel_prefetch(token_count)
 
-    asyncio.create_task(track_usage(stream_id, token, token_data))
+    spawn(track_usage(stream_id, token, token_data), name="track_usage")
 
     common_headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
 
@@ -434,7 +519,7 @@ def _get_userbot_streamer() -> ByteStreamer:
     if botmod.Userbot is None:
         return None
     if _userbot_streamer is None or _userbot_streamer.client is not botmod.Userbot:
-        _userbot_streamer = ByteStreamer(botmod.Userbot, USERBOT_CLIENT_INDEX)
+        _userbot_streamer = get_streamer(botmod.Userbot, USERBOT_CLIENT_INDEX)
     return _userbot_streamer
 
 
@@ -473,7 +558,7 @@ async def global_media_streamer(request: Request, chat_id: int, msg_id: int, tok
         "global_search": True,
     }
 
-    asyncio.create_task(track_usage(stream_id, token, token_data))
+    spawn(track_usage(stream_id, token, token_data), name="track_usage")
 
     headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
 
@@ -529,7 +614,7 @@ async def global_virtual_media_streamer(request: Request, parts_payload: list, t
         "split_parts": len(parts),
     }
 
-    asyncio.create_task(track_usage(stream_id, token, token_data))
+    spawn(track_usage(stream_id, token, token_data), name="track_usage")
 
     headers, status = _build_stream_headers(mime_type, file_name, req_length, range_header, start, end, file_size)
 
@@ -607,7 +692,7 @@ async def _zip_media_streamer(request, parts_payload, token, token_data, stream_
         "token": token,
         "zip_parts": len(parts),
     }
-    asyncio.create_task(track_usage(stream_id, token, token_data))
+    spawn(track_usage(stream_id, token, token_data), name="track_usage")
 
     headers, status = _build_stream_headers(mime_type, inner_name, req_length, range_header, start, end, inner_size)
     if request.method == "HEAD":

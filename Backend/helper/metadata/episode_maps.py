@@ -263,6 +263,7 @@ async def ensure_anime_lists() -> Dict[int, AnimeListEntry]:
 
         if raw:
             parsed = _parse_anime_lists_xml(raw)
+            del raw
             if parsed:
                 _anime_lists = parsed
                 _anime_lists_by_imdb = _rebuild_imdb_index(parsed)
@@ -271,6 +272,9 @@ async def ensure_anime_lists() -> Dict[int, AnimeListEntry]:
                     f"[EP_MAPS] Anime-Lists loaded: {len(parsed)} entries, "
                     f"{len(_anime_lists_by_imdb)} imdb keys"
                 )
+            del parsed
+            from Backend.helper.memory import release_memory
+            await asyncio.to_thread(release_memory, "anime-lists-refresh")
         return _anime_lists
 
 
@@ -457,9 +461,35 @@ async def ensure_anibridge() -> dict:
 
         if isinstance(data, dict):
             data.pop("$meta", None)
-            _anibridge = data
+            filtered = {}
+            for src_desc, targets in data.items():
+                if not (src_desc.startswith("anidb:") or src_desc.startswith("anilist:") or src_desc.startswith("mal:")):
+                    continue
+                if not isinstance(targets, dict):
+                    continue
+                valid_targets = {}
+                for tgt_desc, range_map in targets.items():
+                    if tgt_desc.startswith("tvdb_show:") or tgt_desc.startswith("tmdb_show:"):
+                        valid_targets[tgt_desc] = range_map
+                if valid_targets:
+                    filtered[src_desc] = valid_targets
+
+            _anibridge = filtered
             _anibridge_loaded_at = time.time()
-            LOGGER.info(f"[EP_MAPS] anibridge loaded: {len(data)} source descriptors")
+            LOGGER.info(
+                f"[EP_MAPS] anibridge loaded: {len(filtered)} filtered source descriptors (reduced from {len(data)})"
+            )
+            del data
+            try:
+                del raw
+            except (NameError, UnboundLocalError):
+                pass
+            try:
+                del raw_json
+            except (NameError, UnboundLocalError):
+                pass
+            from Backend.helper.memory import release_memory
+            await asyncio.to_thread(release_memory, "anibridge-refresh")
         return _anibridge
 
 

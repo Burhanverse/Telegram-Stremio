@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -8,19 +10,20 @@ from pyrogram.errors import FloodWait, ChannelPrivate, ChatAdminRequired
 
 from Backend.logger import LOGGER
 from Backend.helper.encrypt import encode_string, decode_string
-from Backend.helper.metadata import metadata, extract_default_id
+from Backend.helper.memory import release_memory, spawn
+from Backend.helper.metadata import metadata, extract_default_id, clear_metadata_ram_caches
 from Backend.helper.pyro import apply_video_thumb_to_metadata, clean_filename, finalize_media_name, get_readable_file_size
 from Backend.helper.skip_channel import is_skip_channel, route_to_skip_channel
 from Backend.helper.split_files import parse_split_info
 from Backend.helper.subtitles import ingest_subtitle, is_subtitle_file
 
-SCAN_BATCH_SIZE = 200          
+SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "200"))
 SCAN_MAX_EMPTY_BATCHES = 10    
 SCAN_MAX_ID_CAP = 1_000_000    
 SCAN_BATCH_DELAY = 0.5         
 SCAN_PERSIST_EVERY = 1         
 SCAN_PROBE_TEXT = "🔄"         
-SCAN_PROCESS_CONCURRENCY = 8   
+SCAN_PROCESS_CONCURRENCY = int(os.getenv("SCAN_PROCESS_CONCURRENCY", "8"))   
 
 DBCHECK_CONCURRENCY = 5        
 DBCHECK_BATCH_DELAY = 0.3      
@@ -239,7 +242,7 @@ class ScanManager:
             self._cancel = False
             await self._persist()
 
-            self._task = asyncio.create_task(self._run(client))
+            self._task = spawn(self._run(client), name="scan-manager-run")
             return {"ok": True, "message": f"{'Rescan' if mode == 'rescan' else 'Scan'} started.",
                     "status": self.get_status()}
 
@@ -295,6 +298,9 @@ class ScanManager:
             self.state["finished_at"] = _now()
             LOGGER.error(f"[ScanManager] Unexpected error: {e}")
             await self._persist()
+        finally:
+            clear_metadata_ram_caches()
+            await asyncio.to_thread(release_memory, "scan-finished")
 
     async def _scan_channel(self, client, chat_id: int, ch_key: str) -> bool:
         s = self.state
@@ -381,6 +387,12 @@ class ScanManager:
 
                 await asyncio.gather(*(_worker(m) for m in to_process))
 
+            del messages, to_process
+
+            batch_count += 1
+            if batch_count % 25 == 0:
+                gc.collect()
+
             if self._cancel:
                 s["cursors"][str(ch_key)] = current
                 s["current_id"] = current
@@ -392,7 +404,6 @@ class ScanManager:
             s["cursors"][str(ch_key)] = current
             s["current_id"] = current
 
-            batch_count += 1
             if batch_count % SCAN_PERSIST_EVERY == 0:
                 await self._persist()
 
@@ -636,7 +647,7 @@ class DbCheckManager:
             self.state["status"] = "running"
             self.state["started_at"] = _now()
             self._cancel = False
-            self._task = asyncio.create_task(self._run(client))
+            self._task = spawn(self._run(client), name="dbcheck-run")
             return {"ok": True, "message": "DB check started.", "status": self.get_status()}
 
     async def cancel(self) -> Dict[str, Any]:
@@ -771,6 +782,8 @@ class DbCheckManager:
             s["error"] = str(e)
             s["finished_at"] = _now()
             LOGGER.error(f"[DbCheck] Error: {e}")
+        finally:
+            await asyncio.to_thread(release_memory, "dbcheck-finished")
 
     #----- ── Purge ────────────────────────────────────────────────────────────────────
     async def purge(self, stream_ids: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -818,6 +831,7 @@ class DuplicateManager:
             "groups": [],
             "duplicate_count": 0,
             "purged": 0,
+            "truncated": False,
             "started_at": 0.0,
             "finished_at": 0.0,
             "error": None,
@@ -827,6 +841,9 @@ class DuplicateManager:
             "purge_started_at": 0.0,
             "purge_finished_at": 0.0,
         }
+
+    def reset(self) -> None:
+        self.state = self._blank_state()
 
     def bind_db(self, db) -> None:
         self._db = db
@@ -860,6 +877,7 @@ class DuplicateManager:
             "group_count": len(s["groups"]),
             "duplicate_count": s["duplicate_count"],
             "purged": s["purged"],
+            "truncated": bool(s.get("truncated", False)),
             "groups": list(s["groups"]),
             "elapsed": _fmt_elapsed(elapsed),
             "elapsed_seconds": int(elapsed),
@@ -883,7 +901,7 @@ class DuplicateManager:
             self.state["status"] = "running"
             self.state["started_at"] = _now()
             self._cancel = False
-            self._task = asyncio.create_task(self._run())
+            self._task = spawn(self._run(), name="duplicate-scan-run")
             return {"ok": True, "message": "Duplicate scan started.", "status": self.get_status()}
 
     async def cancel(self) -> Dict[str, Any]:
@@ -902,6 +920,10 @@ class DuplicateManager:
         for items in buckets.values():
             if len(items) < 2:
                 continue
+            if len(self.state["groups"]) >= 5000:
+                self.state["truncated"] = True
+                self.state["duplicate_count"] += len(items) - 1
+                continue
             gid += 1
             self.state["groups"].append({
                 "group_id": gid,
@@ -919,6 +941,13 @@ class DuplicateManager:
     async def _run(self) -> None:
         db = self._db
         s = self.state
+        movie_proj = {"title": 1, "release_year": 1, "telegram": 1}
+        tv_proj = {
+            "title": 1,
+            "seasons.season_number": 1,
+            "seasons.episodes.episode_number": 1,
+            "seasons.episodes.telegram": 1,
+        }
         try:
             gid = 0
             for i in range(1, db.current_db_index + 1):
@@ -926,7 +955,7 @@ class DuplicateManager:
                 if storage is None:
                     continue
 
-                async for movie in storage["movie"].find({}):
+                async for movie in storage["movie"].find({}, movie_proj):
                     if self._cancel:
                         break
                     s["scanned"] += 1
@@ -934,7 +963,7 @@ class DuplicateManager:
                     label = f"{movie.get('title') or 'Unknown'}{f' ({year})' if year else ''}"
                     gid = self._collect(movie.get("telegram", []), label, "movie", gid)
 
-                async for show in storage["tv"].find({}):
+                async for show in storage["tv"].find({}, tv_proj):
                     if self._cancel:
                         break
                     s["scanned"] += 1
@@ -956,6 +985,8 @@ class DuplicateManager:
             s["error"] = str(e)
             s["finished_at"] = _now()
             LOGGER.error(f"[Duplicates] Error: {e}")
+        finally:
+            await asyncio.to_thread(release_memory, "duplicate-scan-finished")
 
     #----- Delete duplicates: explicit ids, or (delete_all) keep the newest per group.
     #----- Runs in the background so the UI can poll deletion progress.
@@ -979,7 +1010,7 @@ class DuplicateManager:
             self.state["purge_done"] = 0
             self.state["purge_started_at"] = _now()
             self.state["purge_finished_at"] = 0.0
-            self._purge_task = asyncio.create_task(self._run_purge(ids))
+            self._purge_task = spawn(self._run_purge(ids), name="duplicate-purge-run")
             return {"ok": True, "message": f"Removing {len(ids)} duplicate(s)…",
                     "total": len(ids), "status": self.get_status()}
 
@@ -1014,6 +1045,7 @@ class DuplicateManager:
             LOGGER.error(f"[Duplicates] cleanup error: {e}")
         finally:
             s["purge_finished_at"] = _now()
+            await asyncio.to_thread(release_memory, "duplicate-purge-finished")
 
 
 #----- ── Singletons ──────────────────────────────────────────────────────────────

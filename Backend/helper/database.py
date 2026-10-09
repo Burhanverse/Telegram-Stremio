@@ -1,7 +1,7 @@
 import re
 import secrets
 import string
-from asyncio import create_task
+from Backend.helper.memory import spawn
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1057,7 +1057,7 @@ class Database:
                 .limit(page_size - len(results))
             )
 
-            docs = await cursor.to_list(None)
+            docs = await cursor.to_list(length=page_size - len(results))
             results.extend(docs)
 
             if len(results) >= page_size:
@@ -1356,7 +1356,7 @@ class Database:
         try:
             chat_id = int(f"-100{part['chat_id']}")
             msg_id = int(part["msg_id"])
-            create_task(delete_message(chat_id, msg_id))
+            spawn(delete_message(chat_id, msg_id), name="delete_message")
         except Exception as e:
             LOGGER.error(f"Failed to delete split part message: {e}")
 
@@ -1709,8 +1709,12 @@ class Database:
                 tv_match = {"$and": [tv_match, extra_filter]}
                 movie_match = {"$and": [movie_match, extra_filter]}
 
+            # Limiting to (skip + page_size) on each of tv and movie is correct only
+            # because this search aggregation pipeline has no $sort stage before slicing.
+            needed = skip + page_size
             tv_pipeline = [
                 {"$match": tv_match},
+                {"$limit": needed},
                 {"$project": {
                     "_id": 1, "tmdb_id": 1, "title": 1, "genres": 1, "rating": 1, "imdb_id": 1,
                     "release_year": 1, "release_year_end": 1, "poster": 1, "backdrop": 1, "description": 1, "logo": 1,
@@ -1720,6 +1724,7 @@ class Database:
             
             movie_pipeline = [
                 {"$match": movie_match},
+                {"$limit": needed},
                 {"$project": {
                     "_id": 1, "tmdb_id": 1, "title": 1, "genres": 1, "rating": 1,
                     "release_year": 1, "release_year_end": 1, "poster": 1, "backdrop": 1, "description": 1,
@@ -1734,18 +1739,19 @@ class Database:
             active_db = self.dbs[active_db_key]
             dbs_checked.append(self.current_db_index)
             
-            tv_results = await active_db["tv"].aggregate(tv_pipeline).to_list(None)
-            movie_results = await active_db["movie"].aggregate(movie_pipeline).to_list(None)
+            tv_results = await active_db["tv"].aggregate(tv_pipeline).to_list(needed)
+            movie_results = await active_db["movie"].aggregate(movie_pipeline).to_list(needed)
             combined = tv_results + movie_results
             results.extend(combined)
             
-            if len(results) < page_size:
+            if len(results) < needed:
                 previous_db_index = self.current_db_index - 1
-                while previous_db_index > 0 and len(results) < page_size:
+                while previous_db_index > 0 and len(results) < needed:
                     prev_db_key = f"storage_{previous_db_index}"
                     prev_db = self.dbs[prev_db_key]
-                    tv_results_prev = await prev_db["tv"].aggregate(tv_pipeline).to_list(None)
-                    movie_results_prev = await prev_db["movie"].aggregate(movie_pipeline).to_list(None)
+                    remaining = max(0, needed - len(results))
+                    tv_results_prev = await prev_db["tv"].aggregate(tv_pipeline).to_list(remaining)
+                    movie_results_prev = await prev_db["movie"].aggregate(movie_pipeline).to_list(remaining)
                     combined_prev = tv_results_prev + movie_results_prev
                     results.extend(combined_prev)
                     dbs_checked.append(previous_db_index)
@@ -1998,7 +2004,7 @@ class Database:
                 return
             chat_id = int(f"-100{decoded['chat_id']}")
             msg_id = int(decoded["msg_id"])
-            create_task(delete_message(chat_id, msg_id))
+            spawn(delete_message(chat_id, msg_id), name="delete_message")
         except Exception as e:
             LOGGER.error(f"Failed to queue file for deletion: {e}")
 
@@ -2549,7 +2555,7 @@ class Database:
                 }},
                 {"$sort": {"_id": 1}},
             ]
-            per_client = await col.aggregate(per_client_pipeline).to_list(None)
+            per_client = await col.aggregate(per_client_pipeline).to_list(100)
             for row in per_client:
                 row["client_index"] = row.pop("_id")
                 row["avg_mbps"]     = round(row.get("avg_mbps", 0), 3)
@@ -2562,7 +2568,7 @@ class Database:
                  "total_bytes": 1, "duration_sec": 1, "avg_mbps": 1,
                  "peak_mbps": 1, "status": 1, "logged_at": 1, "title": 1}
             ).sort("logged_at", DESCENDING).limit(limit)
-            recent = await recent_cursor.to_list(None)
+            recent = await recent_cursor.to_list(limit)
             for r in recent:
                 if "logged_at" in r and r["logged_at"] is not None:
                     ts = r["logged_at"]
@@ -2576,7 +2582,7 @@ class Database:
                 {"$group": {"_id": "$title", "streams": {"$sum": 1}, "total_bytes": {"$sum": "$total_bytes"}}},
                 {"$sort": {"streams": -1}},
                 {"$limit": 8},
-            ]).to_list(None)
+            ]).to_list(8)
             for r in top_titles:
                 r["title"] = r.pop("_id")
 
@@ -2586,7 +2592,7 @@ class Database:
                 {"$group": {"_id": "$user_name", "streams": {"$sum": 1}, "total_bytes": {"$sum": "$total_bytes"}}},
                 {"$sort": {"total_bytes": -1}},
                 {"$limit": 8},
-            ]).to_list(None)
+            ]).to_list(8)
             for r in top_users:
                 r["user"] = r.pop("_id")
 
@@ -2599,7 +2605,7 @@ class Database:
                 }},
                 {"$sort": {"_id": -1}},
                 {"$limit": 14},
-            ]).to_list(None)
+            ]).to_list(14)
             for r in per_day:
                 r["date"] = r.pop("_id")
             per_day.reverse()

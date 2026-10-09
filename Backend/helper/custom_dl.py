@@ -12,9 +12,11 @@ from pyrogram import Client, raw
 from pyrogram.errors import AuthBytesInvalid
 from pyrogram.file_id import FileId
 from pyrogram.session import Auth, Session
+from cachetools import LRUCache
 
 from Backend import db
 from Backend.helper.exceptions import FileNotFound
+from Backend.helper.memory import spawn
 from Backend.helper.pyro import get_file_ids
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import client_avg_mbps, client_dc_map, client_failures, multi_clients, work_loads
@@ -58,7 +60,7 @@ def _ensure_stale_cleaner():
     global _STALE_CLEANER_STARTED
     if not _STALE_CLEANER_STARTED:
         _STALE_CLEANER_STARTED = True
-        asyncio.create_task(_cleanup_stale_streams())
+        spawn(_cleanup_stale_streams(), name="cleanup_stale_streams")
 
 
 #----- Telegram file byte streamer with prefetch, multi-client parallelism, and telemetry
@@ -70,13 +72,44 @@ class ByteStreamer:
     def __init__(self, client: Client, client_index: int = -1):
         self.client = client
         self.client_index = client_index
-        self._file_id_cache: Dict[Tuple[int, int], FileId] = {}
+        self._file_id_cache: LRUCache = LRUCache(maxsize=2048)
         self._session_lock = asyncio.Lock()
+        self._clean_task: Optional[asyncio.Task] = None
+        self._prewarm_task: Optional[asyncio.Task] = None
+        self._created_dcs: set[int] = set()
         if client_index >= 0:
             ByteStreamer._instances[client_index] = self
-        asyncio.create_task(self._clean_cache())
-        asyncio.create_task(self._prewarm_sessions())
+
+    def start(self) -> None:
+        if self._clean_task is None or self._clean_task.done():
+            self._clean_task = spawn(self._clean_cache(), name=f"bytestreamer_clean_{self.client_index}")
+        if self._prewarm_task is None or self._prewarm_task.done():
+            self._prewarm_task = spawn(self._prewarm_sessions(), name=f"bytestreamer_prewarm_{self.client_index}")
         _ensure_stale_cleaner()
+
+    async def close(self) -> None:
+        if self._clean_task and not self._clean_task.done():
+            self._clean_task.cancel()
+            try:
+                await self._clean_task
+            except asyncio.CancelledError:
+                pass
+        if self._prewarm_task and not self._prewarm_task.done():
+            self._prewarm_task.cancel()
+            try:
+                await self._prewarm_task
+            except asyncio.CancelledError:
+                pass
+        if hasattr(self.client, "media_sessions") and self.client.media_sessions:
+            for dc in list(self._created_dcs):
+                session = self.client.media_sessions.pop(dc, None)
+                if session:
+                    try:
+                        await session.stop()
+                    except Exception as e:
+                        LOGGER.warning(f"Error stopping media session dc {dc}: {e}")
+        self._created_dcs.clear()
+        self._file_id_cache.clear()
 
     async def _prewarm_sessions(self):
         common_dcs = [1, 2, 4, 5]
@@ -85,6 +118,7 @@ class ByteStreamer:
         for dc in common_dcs:
             if dc in self.client.media_sessions or dc == current_dc:
                 continue
+            session = None
             try:
                 auth_key = await Auth(self.client, dc, test_mode).create()
                 session = Session(self.client, dc, auth_key, test_mode, is_media=True)
@@ -107,8 +141,16 @@ class ByteStreamer:
                         break
                 if imported:
                     self.client.media_sessions[dc] = session
+                    self._created_dcs.add(dc)
                 else:
                     await session.stop()
+            except asyncio.CancelledError:
+                if session is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(session.stop()), timeout=3.0)
+                    except Exception:
+                        pass
+                raise
             except Exception:
                 continue
 
@@ -351,7 +393,7 @@ class ByteStreamer:
                     scheduled_tasks.clear()
 
         async def consumer_generator():
-            producer_task = asyncio.create_task(producer())
+            producer_task = spawn(producer(), name="custom-dl-producer")
             current_part_idx = 1
             _disconnect_check_counter = 0
 
@@ -473,8 +515,11 @@ class ByteStreamer:
                     else:
                         client_avg_mbps[client_index] = 0.5 * prev + 0.5 * avg_mbps
 
-                    asyncio.create_task(db.log_stream_stats(stream_entry))
-
+                    try:
+                        spawn(db.log_stream_stats(stream_entry), name=f"log_stream_stats_{stream_id}")
+                    except Exception as log_err:
+                        LOGGER.warning(f"Error logging stream stats: {log_err}")
+                finally:
                     async def delayed_pop():
                         await asyncio.sleep(3)
                         try:
@@ -483,8 +528,7 @@ class ByteStreamer:
                         except Exception:
                             pass
 
-                    asyncio.create_task(delayed_pop())
-                finally:
+                    spawn(delayed_pop(), name=f"delayed_pop_{stream_id}")
                     try:
                         work_loads[client_index] -= 1
                     except Exception:
@@ -547,10 +591,43 @@ class ByteStreamer:
         )
 
     async def _clean_cache(self) -> None:
-        while True:
-            await asyncio.sleep(self.CLEAN_INTERVAL)
-            self._file_id_cache.clear()
-            LOGGER.debug("ByteStreamer: cleared file_id cache")
+        try:
+            while True:
+                await asyncio.sleep(self.CLEAN_INTERVAL)
+                self._file_id_cache.clear()
+                LOGGER.debug("ByteStreamer: cleared file_id cache")
+        except asyncio.CancelledError:
+            pass
+
+
+_streamer_by_client: Dict[Client, ByteStreamer] = {}
+
+
+def get_streamer(client: Client, client_index: int = -1) -> ByteStreamer:
+    if client in _streamer_by_client:
+        return _streamer_by_client[client]
+    if client_index >= 0 and client_index in ByteStreamer._instances:
+        inst = ByteStreamer._instances[client_index]
+        _streamer_by_client[client] = inst
+        return inst
+    streamer = ByteStreamer(client, client_index)
+    streamer.start()
+    _streamer_by_client[client] = streamer
+    if client_index >= 0:
+        ByteStreamer._instances[client_index] = streamer
+    return streamer
+
+
+async def close_streamer_for_client(client: Optional[Client], client_id: int) -> None:
+    streamer = None
+    if client is not None and client in _streamer_by_client:
+        streamer = _streamer_by_client.pop(client, None)
+    if client_id in ByteStreamer._instances:
+        idx_streamer = ByteStreamer._instances.pop(client_id, None)
+        if streamer is None:
+            streamer = idx_streamer
+    if streamer is not None:
+        await streamer.close()
 
 
 #----- Speed test helper (runs independently, on-demand per file)
@@ -576,7 +653,7 @@ async def _speed_test_single_client(
         "error": None,
     }
     try:
-        streamer = ByteStreamer(client)
+        streamer = get_streamer(client, client_index)
         file_id = await streamer.get_file_properties(chat_id, message_id)
 
         media_session = await streamer._get_media_session(file_id)
@@ -636,7 +713,7 @@ async def _speed_test_single_client(
                             prog_res["time_taken_sec"] = round(elapsed_so_far, 3)
                             prog_res["speed_mbps"] = round(current_speed, 3)
                             if asyncio.iscoroutinefunction(progress_callback):
-                                asyncio.create_task(progress_callback(prog_res))
+                                spawn(progress_callback(prog_res), name="speedtest-progress")
                             else:
                                 progress_callback(prog_res)
                         last_progress_time = now
@@ -655,7 +732,7 @@ async def _speed_test_single_client(
                 finally:
                     queue.task_done()
         workers = [
-            asyncio.create_task(fetch_chunk_worker())
+            spawn(fetch_chunk_worker(), name="speedtest-fetch-worker")
             for _ in range(max_concurrent_chunks)
         ]
         

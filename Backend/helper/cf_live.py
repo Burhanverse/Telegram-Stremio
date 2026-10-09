@@ -4,6 +4,7 @@ from collections import deque
 
 from Backend import db
 from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS
+from Backend.helper.memory import spawn
 from Backend.pyrofork.bot import client_avg_mbps, work_loads
 
 MIB = 1024 * 1024
@@ -83,4 +84,4 @@ def _finish(sid: str, entry: dict) -> None:
         prev = client_avg_mbps.get(idx, 0.0)
         client_avg_mbps[idx] = entry["avg_mbps"] if prev == 0.0 else 0.5 * prev + 0.5 * entry["avg_mbps"]
     RECENT_STREAMS.appendleft(entry)
-    asyncio.create_task(db.log_stream_stats(entry))
+    spawn(db.log_stream_stats(entry), name="cf-log-stream-stats")
