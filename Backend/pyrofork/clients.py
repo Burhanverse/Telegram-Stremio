@@ -1,6 +1,9 @@
+import asyncio
+import logging
 from asyncio import gather
 
 from pyrogram import Client
+from pyrogram.session import Session
 
 from Backend.config import Telegram
 from Backend.helper.custom_dl import close_streamer_for_client
@@ -8,6 +11,59 @@ from Backend.helper.memory import spawn
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import StreamBot, client_dc_map, multi_clients, work_loads
+
+logger = logging.getLogger(__name__)
+
+_orig_stop = Session.stop
+
+
+async def _safe_session_stop(self, *args, **kwargs):
+    # Prevent a crashed recv_task (e.g., RuntimeError) from aborting stop()
+    # before the underlying TCP connection is properly closed.
+    recv_task = getattr(self, "recv_task", None)
+    if recv_task is not None:
+        recv_task.cancel()
+        try:
+            await recv_task
+        except BaseException:
+            pass
+        self.recv_task = None
+    return await _orig_stop(self, *args, **kwargs)
+
+
+async def _do_restart(self):
+    for attempt in range(1, 6):
+        try:
+            await self.stop()
+            await self.start()
+            return
+        except Exception as e:
+            wait_time = min(2 ** attempt, 30)
+            logger.warning(
+                f"Session restart attempt {attempt} failed ({e}). Retrying in {wait_time}s..."
+            )
+            await asyncio.sleep(wait_time)
+
+
+async def _safe_session_restart(self):
+    # If another coroutine is already restarting this Session instance,
+    # wait for the in-flight restart to finish instead of colliding with it.
+    inflight = getattr(self, "_inflight_restart_task", None)
+    if inflight is not None and not inflight.done():
+        await asyncio.shield(inflight)
+        return
+
+    task = asyncio.create_task(_do_restart(self))
+    self._inflight_restart_task = task
+    try:
+        await asyncio.shield(task)
+    finally:
+        if getattr(self, "_inflight_restart_task", None) is task:
+            self._inflight_restart_task = None
+
+
+Session.stop = _safe_session_stop
+Session.restart = _safe_session_restart
 
 client_tokens: dict[int, str] = {}
 
