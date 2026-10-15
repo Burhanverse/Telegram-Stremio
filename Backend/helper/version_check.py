@@ -88,6 +88,23 @@ async def check_upstream_version(force: bool = False) -> dict:
         return dict(_state)
 
 
+def get_kurigram_version() -> str:
+    """Retrieve installed Kurigram package version with fallback."""
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("kurigram")
+    except Exception:
+        try:
+            import importlib.metadata
+            return importlib.metadata.version("pyrofork")
+        except Exception:
+            try:
+                import pyrogram
+                return getattr(pyrogram, "__version__", "unknown")
+            except Exception:
+                return "unknown"
+
+
 def get_version_status() -> dict:
     return {
         "current": __version__,
@@ -95,6 +112,7 @@ def get_version_status() -> dict:
         "update_available": bool(_state["update_available"]),
         "error": _state["error"],
         "checked_at": _state["checked_at"],
+        "kurigram_version": get_kurigram_version(),
     }
 
 
