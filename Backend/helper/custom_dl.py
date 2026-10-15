@@ -68,12 +68,13 @@ class ByteStreamer:
     CHUNK_SIZE = 1024 * 1024
     CLEAN_INTERVAL = 30 * 60
     _instances: Dict[int, "ByteStreamer"] = {}
+    _dc_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
 
     def __init__(self, client: Client, client_index: int = -1):
         self.client = client
         self.client_index = client_index
         self._file_id_cache: LRUCache = LRUCache(maxsize=2048)
-        self._session_lock = asyncio.Lock()
+        self._dc_locks = ByteStreamer._dc_locks
         self._clean_task: Optional[asyncio.Task] = None
         self._prewarm_task: Optional[asyncio.Task] = None
         self._created_dcs: set[int] = set()
@@ -118,41 +119,62 @@ class ByteStreamer:
         for dc in common_dcs:
             if dc in self.client.media_sessions or dc == current_dc:
                 continue
-            session = None
-            try:
-                auth_key = await Auth(self.client, dc, test_mode).create()
-                session = Session(self.client, dc, auth_key, test_mode, is_media=True)
-                session.no_updates = True
-                session.timeout = 30
-                session.sleep_threshold = 60
-                await session.start()
-                imported = False
-                for _ in range(6):
-                    try:
-                        exported = await self.client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc))
-                        await session.send(raw.functions.auth.ImportAuthorization(id=exported.id,bytes=exported.bytes,))
-                        imported = True
-                        break
-                    except AuthBytesInvalid:
-                        await asyncio.sleep(0.5)
-                    except OSError:
-                        await asyncio.sleep(1)
-                    except Exception:
-                        break
-                if imported:
-                    self.client.media_sessions[dc] = session
-                    self._created_dcs.add(dc)
-                else:
-                    await session.stop()
-            except asyncio.CancelledError:
-                if session is not None:
-                    try:
-                        await asyncio.wait_for(asyncio.shield(session.stop()), timeout=3.0)
-                    except Exception:
-                        pass
-                raise
-            except Exception:
-                continue
+            lock_key = (id(self.client), dc)
+            lock = self._dc_locks.setdefault(lock_key, asyncio.Lock())
+            async with lock:
+                if dc in self.client.media_sessions or dc == current_dc:
+                    continue
+                session = None
+                try:
+                    if hasattr(self.client, "get_session"):
+                        session = await self.client.get_session(dc, is_media=True)
+                    else:
+                        dc_opt = await self.client.get_dc_option(dc, is_media=True) if hasattr(self.client, "get_dc_option") else None
+                        if dc_opt:
+                            auth_key = await Auth(self.client, dc, dc_opt.ip_address, dc_opt.port, test_mode).create()
+                            session = Session(self.client, dc, dc_opt.ip_address, dc_opt.port, auth_key, test_mode, is_media=True)
+                        else:
+                            auth_key = await Auth(self.client, dc, test_mode).create()
+                            session = Session(self.client, dc, auth_key, test_mode, is_media=True)
+                        await session.start()
+                        imported = False
+                        for _ in range(6):
+                            try:
+                                exported = await self.client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc))
+                                await session.send(raw.functions.auth.ImportAuthorization(id=exported.id, bytes=exported.bytes))
+                                imported = True
+                                break
+                            except AuthBytesInvalid:
+                                await asyncio.sleep(0.5)
+                            except OSError:
+                                await asyncio.sleep(1)
+                            except Exception:
+                                break
+                        if not imported:
+                            await session.stop()
+                            session = None
+
+                    if session is not None:
+                        session.no_updates = True
+                        session.timeout = 30
+                        session.sleep_threshold = 60
+                        self.client.media_sessions[dc] = session
+                        self._created_dcs.add(dc)
+                except asyncio.CancelledError:
+                    if session is not None:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(session.stop()), timeout=3.0)
+                        except Exception:
+                            pass
+                    raise
+                except Exception:
+                    failed = session or (self.client.media_sessions.pop(dc, None) if hasattr(self.client, "media_sessions") else None)
+                    if failed is not None:
+                        try:
+                            await failed.stop()
+                        except Exception:
+                            pass
+                    continue
 
     #----- Fetch (and cache) Telegram FileId properties for a message
     async def get_file_properties(self, chat_id: int, message_id: int) -> FileId:
@@ -215,7 +237,7 @@ class ByteStreamer:
         q: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
         stop_event = asyncio.Event()
 
-        media_session = await self._get_media_session(file_id)
+        media_session = await self.generate_media_session(file_id)
         location_box: List[object] = [await self._get_location(file_id)]
         async def _make_refresh_fn(loc_b, streamer_ref, file_id_ref):
             async def _refresh() -> bool:
@@ -240,7 +262,7 @@ class ByteStreamer:
         if extra_clients:
             for ec_idx, ec_streamer, ec_file_id in extra_clients:
                 try:
-                    ec_session = await ec_streamer._get_media_session(ec_file_id)
+                    ec_session = await ec_streamer.generate_media_session(ec_file_id)
                     ec_loc_box = [await ByteStreamer._get_location(ec_file_id)]
                     ec_refresh = await _make_refresh_fn(ec_loc_box, ec_streamer, ec_file_id)
                     session_pool.append((ec_idx, ec_session, ec_loc_box, ec_refresh))
@@ -538,46 +560,76 @@ class ByteStreamer:
 
         return consumer_generator()
 
-    async def _get_media_session(self, file_id: FileId) -> Session:
-        dc = file_id.dc_id
-        media_session = self.client.media_sessions.get(dc)
+    async def generate_media_session(self, file_id: FileId) -> Session:
+        dc_id = file_id.dc_id
+        client = self.client
 
-        if media_session:
+        # Fast path: zero lock overhead once the DC session is initialized
+        media_session = client.media_sessions.get(dc_id)
+        if media_session is not None:
             return media_session
 
-        async with self._session_lock:
-            media_session = self.client.media_sessions.get(dc)
-            if media_session:
+        # Slow path: only runs once per (client, dc_id) on cold start
+        lock_key = (id(client), dc_id)
+        lock = self._dc_locks.setdefault(lock_key, asyncio.Lock())
+
+        async with lock:
+            media_session = client.media_sessions.get(dc_id)
+            if media_session is not None:
                 return media_session
 
-            test_mode = await self.client.storage.test_mode()
-            current_dc = await self.client.storage.dc_id()
+            session = None
+            try:
+                if hasattr(client, "get_session"):
+                    session = await client.get_session(dc_id, is_media=True)
+                else:
+                    test_mode = await client.storage.test_mode()
+                    current_dc = await client.storage.dc_id()
 
-            if dc != current_dc:
-                auth_key = await Auth(self.client, dc, test_mode).create()
-            else:
-                auth_key = await self.client.storage.auth_key()
+                    dc_opt = await client.get_dc_option(dc_id, is_media=True) if hasattr(client, "get_dc_option") else None
+                    if dc_id != current_dc:
+                        if dc_opt:
+                            auth_key = await Auth(client, dc_id, dc_opt.ip_address, dc_opt.port, test_mode).create()
+                        else:
+                            auth_key = await Auth(client, dc_id, test_mode).create()
+                    else:
+                        auth_key = await client.storage.auth_key()
 
-            session = Session(self.client, dc, auth_key, test_mode, is_media=True)
-            session.no_updates = True
-            session.timeout = 30 
-            session.sleep_threshold = 60 
+                    if dc_opt:
+                        session = Session(client, dc_id, dc_opt.ip_address, dc_opt.port, auth_key, test_mode, is_media=True)
+                    else:
+                        session = Session(client, dc_id, auth_key, test_mode, is_media=True)
 
-            await session.start()
+                    await session.start()
 
-            if dc != current_dc:
-                for _ in range(6):
+                    if dc_id != current_dc:
+                        for _ in range(6):
+                            try:
+                                exported = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                                await session.send(raw.functions.auth.ImportAuthorization(id=exported.id, bytes=exported.bytes))
+                                break
+                            except AuthBytesInvalid:
+                                await asyncio.sleep(0.5)
+                            except OSError:
+                                await asyncio.sleep(1)
+
+                if session is not None:
+                    session.no_updates = True
+                    session.timeout = 30
+                    session.sleep_threshold = 60
+                    client.media_sessions[dc_id] = session
+                    self._created_dcs.add(dc_id)
+                return session
+            except Exception:
+                failed_session = session or (client.media_sessions.pop(dc_id, None) if hasattr(client, "media_sessions") else None)
+                if failed_session is not None:
                     try:
-                        exported = await self.client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc))
-                        await session.send(raw.functions.auth.ImportAuthorization(id=exported.id, bytes=exported.bytes))
-                        break
-                    except AuthBytesInvalid:
-                        await asyncio.sleep(0.5)
-                    except OSError:
-                        await asyncio.sleep(1)
+                        await failed_session.stop()
+                    except Exception as stop_exc:
+                        LOGGER.warning(f"Error stopping failed media session for DC {dc_id}: {stop_exc}")
+                raise
 
-            self.client.media_sessions[dc] = session
-            return session
+    _get_media_session = generate_media_session
 
     @staticmethod
     async def _get_location(file_id: FileId) -> Union[
@@ -656,7 +708,7 @@ async def _speed_test_single_client(
         streamer = get_streamer(client, client_index)
         file_id = await streamer.get_file_properties(chat_id, message_id)
 
-        media_session = await streamer._get_media_session(file_id)
+        media_session = await streamer.generate_media_session(file_id)
         location = await ByteStreamer._get_location(file_id)
         ping_start = time.perf_counter()
         tiny = await media_session.send(
