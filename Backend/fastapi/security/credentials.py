@@ -13,13 +13,19 @@ def verify_credentials(username: str, password: str) -> bool:
 
 #----- Whether the session carries a valid authentication flag
 def is_authenticated(request: Request) -> bool:
-    return bool(request.session.get("authenticated"))
+    try:
+        return bool(request.session.get("authenticated"))
+    except (AssertionError, AttributeError, KeyError):
+        return False
 
 
 #----- Logged-in username from the session, or None
 def get_current_user(request: Request) -> str | None:
     if is_authenticated(request):
-        return request.session.get("username", "admin")
+        try:
+            return request.session.get("username", "admin")
+        except (AssertionError, AttributeError, KeyError):
+            return "admin"
     return None
 
 

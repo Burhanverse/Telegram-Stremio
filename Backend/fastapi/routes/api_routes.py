@@ -148,7 +148,7 @@ def _resolve_covers(items) -> None:
 
 #----- Media management
 async def list_media_api(
-    media_type: str = Query("movie", regex="^(movie|tv)$"),
+    media_type: str = Query("movie", pattern="^(movie|tv)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(24, ge=1, le=100),
     search: str = Query("", max_length=100),
@@ -184,7 +184,7 @@ async def list_media_api(
 async def delete_media_api(
     tmdb_id: str | int,
     db_index: int,
-    media_type: str = Query(regex="^(movie|tv)$")
+    media_type: str = Query(pattern="^(movie|tv)$")
 ):
     tmdb_id = _require_tmdb_id(tmdb_id)
     try:
@@ -203,7 +203,7 @@ async def update_media_api(
     request: Request,
     tmdb_id: str | int,
     db_index: int,
-    media_type: str = Query(regex="^(movie|tv)$")
+    media_type: str = Query(pattern="^(movie|tv)$")
 ):
     tmdb_id = _require_tmdb_id(tmdb_id)
     try:
@@ -263,7 +263,7 @@ async def update_media_api(
 async def get_media_details_api(
     tmdb_id: str | int,
     db_index: int,
-    media_type: str = Query(regex="^(movie|tv)$")
+    media_type: str = Query(pattern="^(movie|tv)$")
 ):
     tmdb_id = _require_tmdb_id(tmdb_id)
     try:
@@ -439,7 +439,7 @@ async def speed_test_api(
     quality_id: str = Query(..., description="Encoded quality ID from DB"),
     tmdb_id: str | int = Query(...),
     db_index: int = Query(...),
-    media_type: str = Query(..., regex="^(movie|tv)$"),
+    media_type: str = Query(..., pattern="^(movie|tv)$"),
 ):
     tmdb_id = _require_tmdb_id(tmdb_id)
     try:

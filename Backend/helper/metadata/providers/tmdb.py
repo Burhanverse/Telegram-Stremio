@@ -45,7 +45,10 @@ def get_tmdb_client() -> aioTMDb:
     global _tmdb_client, _tmdb_client_key
     current_key = tmdb_api_key()
     if _tmdb_client is None or _tmdb_client_key != current_key:
-        _tmdb_client = aioTMDb(key=current_key, language="en-US", region="US")
+        try:
+            _tmdb_client = aioTMDb(api_key=current_key, language="en-US", region="US")
+        except TypeError:
+            _tmdb_client = aioTMDb(key=current_key, language="en-US", region="US")
         _tmdb_client_key = current_key
     return _tmdb_client
 

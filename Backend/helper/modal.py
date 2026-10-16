@@ -1,7 +1,11 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 #----- Quality detail schema
@@ -55,7 +59,7 @@ class TVShowSchema(BaseModel):
     cast: Optional[List[str]] = None
     runtime: Optional[str] = None
     media_type: str
-    updated_on: datetime = Field(default_factory=datetime.utcnow)
+    updated_on: datetime = Field(default_factory=_utc_now)
     seasons: List[Season] = Field(default_factory=list)
     is_anime: Optional[bool] = False
     original_language: Optional[str] = None
@@ -85,7 +89,7 @@ class MovieSchema(BaseModel):
     cast: Optional[List[str]] = None
     runtime: Optional[str] = None
     media_type: str
-    updated_on: datetime = Field(default_factory=datetime.utcnow)
+    updated_on: datetime = Field(default_factory=_utc_now)
     telegram: Optional[List[QualityDetail]]
     is_anime: Optional[bool] = False
     original_language: Optional[str] = None

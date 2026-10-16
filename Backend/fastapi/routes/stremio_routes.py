@@ -17,7 +17,7 @@ from Backend.helper.analytics import client_ip_from, record_client
 from Backend.fastapi.security.tokens import verify_token
 from Backend.helper.cf_stream import cf_enabled, cf_stream_url
 from Backend.helper.memory import spawn
-from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_theme
+from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_theme, get_request_theme
 from Backend.helper.fanart import fanart_artwork
 from Backend.helper.global_search import global_search, is_global_search_enabled
 from Backend.helper.metadata.providers.cinemeta import get_detail, get_season
@@ -1213,16 +1213,20 @@ async def configure_addon(token: str, request: Request):
         else:
             status_color, status_text, expiry_str = "#22c55e", "Active", "Never"
 
-    return templates.TemplateResponse("stremio_configure.html", {
-        "request": request,
-        "theme": get_theme(request.session.get("theme", DEFAULT_THEME), request.session.get("style", DEFAULT_STYLE)),
-        "manifest_url": manifest_url,
-        "web_install_url": web_install_url,
-        "user_name": user_name,
-        "expiry_str": expiry_str,
-        "status_text": status_text,
-        "status_color": status_color,
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="stremio_configure.html",
+        context={
+            "request": request,
+            "theme": get_request_theme(request),
+            "manifest_url": manifest_url,
+            "web_install_url": web_install_url,
+            "user_name": user_name,
+            "expiry_str": expiry_str,
+            "status_text": status_text,
+            "status_color": status_color,
+        },
+    )
 
 
 #----- Catalogs this token can see, in effective (token or global) order

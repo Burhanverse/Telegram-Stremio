@@ -8,7 +8,7 @@ from fastapi.templating import Jinja2Templates
 
 from Backend import __version__
 from Backend.helper.memory import spawn
-from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_theme
+from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_theme, get_request_theme
 from Backend.fastapi.routes.api_routes import (
     add_custom_catalog_item_api,
     add_subscription_plan_api,
@@ -141,12 +141,26 @@ from Backend.fastapi.routes.template_routes import (
 from Backend.fastapi.security.credentials import require_auth
 from Backend.pyrofork.bot import work_loads_summary
 
+from contextlib import asynccontextmanager
+
 templates = Jinja2Templates(directory="Backend/fastapi/templates")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    spawn(decay_client_failures(), name="decay-client-failures")
+    from Backend.helper.version_check import version_check_loop
+    spawn(version_check_loop(), name="version-check-loop")
+    from Backend.helper.metadata.common import start_metadata_cache_maintenance
+    start_metadata_cache_maintenance()
+    yield
+
 
 app = FastAPI(
     title="Telegram Stremio Media Server",
     description="A powerful, self-hosted Telegram Stremio Media Server built with FastAPI, MongoDB, and Kurigram seamlessly integrated with Stremio for automated media streaming and discovery.",
-    version=__version__
+    version=__version__,
+    lifespan=lifespan,
 )
 
 #----- Middleware
@@ -162,15 +176,6 @@ try:
     app.mount("/static", StaticFiles(directory="Backend/fastapi/static"), name="static")
 except Exception:
     pass
-
-
-@app.on_event("startup")
-async def _startup():
-    spawn(decay_client_failures(), name="decay-client-failures")
-    from Backend.helper.version_check import version_check_loop
-    spawn(version_check_loop(), name="version-check-loop")
-    from Backend.helper.metadata.common import start_metadata_cache_maintenance
-    start_metadata_cache_maintenance()
 
 
 #----- Streaming and Stremio routers
@@ -199,9 +204,7 @@ async def set_theme_route(request: Request, theme: str = Form(None), style: str 
 
 @app.get("/manifest.webmanifest")
 async def pwa_manifest(request: Request):
-    theme_name = request.session.get("theme", DEFAULT_THEME)
-    style_name = request.session.get("style", DEFAULT_STYLE)
-    theme = get_theme(theme_name, style_name)
+    theme = get_request_theme(request)
     return JSONResponse(
         {
             "name": "Telegram Stremio",
@@ -234,9 +237,7 @@ async def pwa_manifest(request: Request):
 
 @app.get("/pwa-icon.svg")
 async def pwa_icon(request: Request):
-    theme_name = request.session.get("theme", DEFAULT_THEME)
-    style_name = request.session.get("style", DEFAULT_STYLE)
-    theme = get_theme(theme_name, style_name)
+    theme = get_request_theme(request)
     primary = theme["colors"]["primary"]
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
@@ -313,7 +314,7 @@ async def edit_media(request: Request, tmdb_id: int, db_index: int, media_type: 
 
 @app.get("/api/media/list")
 async def list_media(
-    media_type: str = Query("movie", regex="^(movie|tv)$"),
+    media_type: str = Query("movie", pattern="^(movie|tv)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(24, ge=1, le=100),
     search: str = Query("", max_length=100),
@@ -618,7 +619,7 @@ async def set_media_visibility(payload: dict, _: bool = Depends(require_auth)):
 async def get_media_visibility(
     tmdb_id: int,
     db_index: int,
-    media_type: str = Query("movie", regex="^(movie|tv|series)$"),
+    media_type: str = Query("movie", pattern="^(movie|tv|series)$"),
     _: bool = Depends(require_auth)
 ):
     return await get_media_visibility_api(tmdb_id, db_index, media_type)
@@ -626,7 +627,7 @@ async def get_media_visibility(
 @app.get("/api/custom-catalogs/search-media")
 async def search_catalog_media(
     query: str,
-    media_type: str = Query("movie", regex="^(movie|tv)$"),
+    media_type: str = Query("movie", pattern="^(movie|tv)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(12, ge=1, le=50),
     _: bool = Depends(require_auth)
@@ -663,7 +664,7 @@ async def update_auto_catalog_settings_route(payload: dict, _: bool = Depends(re
 @app.get("/api/custom-catalogs/{catalog_id}/items")
 async def get_custom_catalog_items(
     catalog_id: str,
-    media_type: str | None = Query(None, regex="^(movie|tv)$"),
+    media_type: str | None = Query(None, pattern="^(movie|tv)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(24, ge=1, le=100),
     _: bool = Depends(require_auth)
@@ -679,7 +680,7 @@ async def remove_custom_catalog_item(
     catalog_id: str,
     tmdb_id: int,
     db_index: int,
-    media_type: str = Query("movie", regex="^(movie|tv)$"),
+    media_type: str = Query("movie", pattern="^(movie|tv)$"),
     _: bool = Depends(require_auth)
 ):
     return await remove_custom_catalog_item_api(catalog_id, tmdb_id, db_index, media_type)

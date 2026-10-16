@@ -3,6 +3,7 @@ FROM ghcr.io/astral-sh/uv:debian-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV LANG=en_US.UTF-8
+ENV UV_PYTHON=3.12
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Allocator hardening (glibc)

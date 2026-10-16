@@ -201,3 +201,13 @@ def get_all_themes():
 
 def get_all_styles():
     return STYLES
+
+
+def get_request_theme(request):
+    try:
+        session = getattr(request, "session", None) or {}
+    except (AssertionError, AttributeError, KeyError):
+        session = {}
+    theme_name = session.get("theme", DEFAULT_THEME)
+    style_name = session.get("style", DEFAULT_STYLE)
+    return get_theme(theme_name, style_name)

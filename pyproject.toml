@@ -3,35 +3,35 @@ name = "Telegram-Stremio"
 version = "5.2.1"
 description = "A powerful, self-hosted Telegram Stremio Media Server built with FastAPI, MongoDB, and Kurigram seamlessly integrated with Stremio for automated media streaming and discovery."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "aiofiles>=24.1.0",
-    "cachetools>=7.2.1",
+    "aiofiles>=25.1.0",
+    "cachetools>=7.2.2",
     "diskcache>=5.6.3",
-    "fastapi>=0.115.12",
-    "guessit>=3.8.0",
-    "httptools>=0.8.0",
+    "fastapi>=0.143.2",
+    "guessit>=4.4.0",
+    "httptools>=0.9.0",
     "httpx>=0.28.1",
     "itsdangerous>=2.2.0",
     "jinja2>=3.1.6",
     "kurigram>=2.2.26",
-    "motor>=3.7.0",
-    "parse-torrent-title>=2.8.1",
-    "python-dotenv>=1.1.0",
-    "python-multipart>=0.0.20",
-    "pytz>=2025.2",
-    "rapidfuzz>=3.14.5",
-    "requests>=2.32.3",
+    "motor>=3.7.1",
+    "parse-torrent-title>=2.8.2",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.32",
+    "pytz>=2026.5",
+    "rapidfuzz>=3.14.6",
+    "requests>=2.34.2",
     "tgcrypto>=1.2.5",
-    "themoviedb>=1.0.2",
-    "uvicorn>=0.34.2",
-    "uvloop>=0.22.1",
+    "themoviedb>=2.0.2",
+    "uvicorn>=0.54.0",
+    "uvloop>=0.23.0",
     "zstandard>=0.25.0",
 ]
 
 [dependency-groups]
 dev = [
-    "deptry>=0.23.1",
+    "deptry>=0.25.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]
