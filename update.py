@@ -29,7 +29,7 @@ stream_handler.setFormatter(formatter)
 basicConfig(handlers=[file_handler, stream_handler], level=INFO)
 
 # ── Load config.env as the base (for DATABASE URI, etc.) ─────────────────────
-load_dotenv("config.env")
+load_dotenv("config.env", override=True)
 
 
 def _fetch_upstream_from_db() -> tuple[str | None, str]:

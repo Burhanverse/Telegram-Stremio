@@ -2,7 +2,8 @@ from os import getenv, path
 
 from dotenv import load_dotenv
 
-load_dotenv(path.join(path.dirname(path.dirname(__file__)), "config.env"))
+CONFIG_PATH = path.join(path.dirname(path.dirname(__file__)), "config.env")
+load_dotenv(CONFIG_PATH, override=True)
 
 
 def _int_env(key: str, default: int = 0) -> int:

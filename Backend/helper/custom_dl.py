@@ -12,6 +12,7 @@ from pyrogram import Client, raw
 from pyrogram.errors import AuthBytesInvalid
 from pyrogram.file_id import FileId
 from pyrogram.session import Auth, Session
+from pyrogram.session.session import SessionState
 from cachetools import LRUCache
 
 from Backend import db
@@ -84,8 +85,8 @@ class ByteStreamer:
     def start(self) -> None:
         if self._clean_task is None or self._clean_task.done():
             self._clean_task = spawn(self._clean_cache(), name=f"bytestreamer_clean_{self.client_index}")
-        if self._prewarm_task is None or self._prewarm_task.done():
-            self._prewarm_task = spawn(self._prewarm_sessions(), name=f"bytestreamer_prewarm_{self.client_index}")
+        # Eager background prewarming of all 4 DCs is disabled to prevent idle TCP disconnects.
+        # Media sessions are opened lazily on demand when a stream actually plays a file from that DC.
         _ensure_stale_cleaner()
 
     async def close(self) -> None:
@@ -113,68 +114,10 @@ class ByteStreamer:
         self._file_id_cache.clear()
 
     async def _prewarm_sessions(self):
-        common_dcs = [1, 2, 4, 5]
-        test_mode = await self.client.storage.test_mode()
-        current_dc = await self.client.storage.dc_id()
-        for dc in common_dcs:
-            if dc in self.client.media_sessions or dc == current_dc:
-                continue
-            lock_key = (id(self.client), dc)
-            lock = self._dc_locks.setdefault(lock_key, asyncio.Lock())
-            async with lock:
-                if dc in self.client.media_sessions or dc == current_dc:
-                    continue
-                session = None
-                try:
-                    if hasattr(self.client, "get_session"):
-                        session = await self.client.get_session(dc, is_media=True)
-                    else:
-                        dc_opt = await self.client.get_dc_option(dc, is_media=True) if hasattr(self.client, "get_dc_option") else None
-                        if dc_opt:
-                            auth_key = await Auth(self.client, dc, dc_opt.ip_address, dc_opt.port, test_mode).create()
-                            session = Session(self.client, dc, dc_opt.ip_address, dc_opt.port, auth_key, test_mode, is_media=True)
-                        else:
-                            auth_key = await Auth(self.client, dc, test_mode).create()
-                            session = Session(self.client, dc, auth_key, test_mode, is_media=True)
-                        await session.start()
-                        imported = False
-                        for _ in range(6):
-                            try:
-                                exported = await self.client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc))
-                                await session.send(raw.functions.auth.ImportAuthorization(id=exported.id, bytes=exported.bytes))
-                                imported = True
-                                break
-                            except AuthBytesInvalid:
-                                await asyncio.sleep(0.5)
-                            except OSError:
-                                await asyncio.sleep(1)
-                            except Exception:
-                                break
-                        if not imported:
-                            await session.stop()
-                            session = None
-
-                    if session is not None:
-                        session.no_updates = True
-                        session.timeout = 30
-                        session.sleep_threshold = 60
-                        self.client.media_sessions[dc] = session
-                        self._created_dcs.add(dc)
-                except asyncio.CancelledError:
-                    if session is not None:
-                        try:
-                            await asyncio.wait_for(asyncio.shield(session.stop()), timeout=3.0)
-                        except Exception:
-                            pass
-                    raise
-                except Exception:
-                    failed = session or (self.client.media_sessions.pop(dc, None) if hasattr(self.client, "media_sessions") else None)
-                    if failed is not None:
-                        try:
-                            await failed.stop()
-                        except Exception:
-                            pass
-                    continue
+        # Eager DC pre-warming is disabled to prevent idle TCP connections from accumulating
+        # and timing out while the server is not actively streaming.
+        # Media sessions are opened lazily on demand per DC in generate_media_session().
+        pass
 
     #----- Fetch (and cache) Telegram FileId properties for a message
     async def get_file_properties(self, chat_id: int, message_id: int) -> FileId:
@@ -564,18 +507,18 @@ class ByteStreamer:
         dc_id = file_id.dc_id
         client = self.client
 
-        # Fast path: zero lock overhead once the DC session is initialized
+        # Fast path: zero lock overhead once the DC session is initialized and running
         media_session = client.media_sessions.get(dc_id)
-        if media_session is not None:
+        if media_session is not None and getattr(media_session, "state", None) == SessionState.STARTED:
             return media_session
 
-        # Slow path: only runs once per (client, dc_id) on cold start
+        # Slow path: only runs once per (client, dc_id) on cold start or when session stopped
         lock_key = (id(client), dc_id)
         lock = self._dc_locks.setdefault(lock_key, asyncio.Lock())
 
         async with lock:
             media_session = client.media_sessions.get(dc_id)
-            if media_session is not None:
+            if media_session is not None and getattr(media_session, "state", None) == SessionState.STARTED:
                 return media_session
 
             session = None

@@ -5,6 +5,7 @@ import asyncio
 import ctypes
 import gc
 import os
+import re
 import resource
 import sys
 import threading
@@ -296,26 +297,99 @@ async def cancel_all_tracked_tasks() -> int:
     return len(tasks)
 
 
+def parse_mem_threshold_mb(val: Any) -> float:
+    """
+    Parse a memory threshold into megabytes (float).
+    Supports raw numbers (e.g. 800, 1024) and human unit strings:
+    - '1gb', '1GB', '1g', '1G' -> 1024.0
+    - '1.5gb', '1.5GB' -> 1536.0
+    - '800mb', '800MB', '800m' -> 800.0
+    - '800' -> 800.0
+    """
+    if val is None:
+        return 0.0
+    s = str(val).strip().strip("\"'").lower()
+    if not s:
+        return 0.0
+
+    m = re.match(r"^([\d.]+)\s*([a-z]*)$", s)
+    if not m:
+        return 0.0
+
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return 0.0
+
+    unit = m.group(2).strip()
+    if not unit or unit in ("mb", "m", "mib"):
+        return round(num, 2)
+    elif unit in ("gb", "g", "gib"):
+        return round(num * 1024.0, 2)
+    elif unit in ("kb", "k", "kib"):
+        return round(num / 1024.0, 2)
+    elif unit in ("b",):
+        return round(num / (1024.0 * 1024.0), 2)
+
+    return round(num, 2)
+
+
+def get_watchdog_threshold_mb() -> float:
+    """Read MEM_WATCHDOG_MB from config.env (prefer disk if present) or environment, parsed to MB."""
+    val = None
+    try:
+        from Backend.config import CONFIG_PATH
+        from dotenv import dotenv_values
+        if os.path.exists(CONFIG_PATH):
+            cfg = dotenv_values(CONFIG_PATH)
+            val = cfg.get("MEM_WATCHDOG_MB")
+    except Exception:
+        pass
+
+    if val is None or str(val).strip() == "":
+        val = os.getenv("MEM_WATCHDOG_MB", "0")
+
+    parsed = parse_mem_threshold_mb(val)
+    if val is not None:
+        os.environ["MEM_WATCHDOG_MB"] = str(val).strip()
+    return parsed
+
+
 async def memory_watchdog_loop(interval_seconds: int = 60) -> None:
     """Periodically check RSS; if above MEM_WATCHDOG_MB, trigger a background memory trim."""
-    threshold_str = os.getenv("MEM_WATCHDOG_MB", "0").strip()
-    try:
-        threshold_mb = float(threshold_str)
-    except ValueError:
-        threshold_mb = 0.0
-
-    if threshold_mb <= 0:
-        return
-
-    LOGGER.info(f"[Memory Watchdog] Started with threshold {threshold_mb}MB (interval {interval_seconds}s)")
+    threshold_mb = get_watchdog_threshold_mb()
+    if threshold_mb > 0:
+        LOGGER.info(f"[Memory Watchdog] Started with threshold {threshold_mb}MB (interval {interval_seconds}s)")
+    else:
+        LOGGER.info(f"[Memory Watchdog] Started in standby (threshold disabled or 0, interval {interval_seconds}s)")
 
     while True:
         await asyncio.sleep(interval_seconds)
+
+        # Dynamically re-read so that changes in config.env or env take effect at runtime
+        current_threshold_mb = get_watchdog_threshold_mb()
+        if current_threshold_mb != threshold_mb:
+            if current_threshold_mb > 0 and threshold_mb <= 0:
+                LOGGER.info(f"[Memory Watchdog] Threshold enabled: {current_threshold_mb}MB")
+            elif current_threshold_mb <= 0 and threshold_mb > 0:
+                LOGGER.info(f"[Memory Watchdog] Threshold disabled (was {threshold_mb}MB)")
+            elif current_threshold_mb > 0:
+                LOGGER.info(f"[Memory Watchdog] Threshold updated: {threshold_mb}MB -> {current_threshold_mb}MB")
+            threshold_mb = current_threshold_mb
+
+        if threshold_mb <= 0:
+            continue
+
         rss_kb = get_rss_kb()
         rss_mb = round(rss_kb / 1024.0, 2)
 
         if rss_mb <= threshold_mb:
             continue
+
+        LOGGER.info(
+            f"[Memory Watchdog] RSS ({rss_mb}MB) exceeded threshold ({threshold_mb}MB). "
+            f"Triggering background memory release."
+        )
 
         # Evict transient metadata RAM caches so live dictionary objects can be reclaimed
         try:
@@ -335,12 +409,5 @@ async def memory_watchdog_loop(interval_seconds: int = 60) -> None:
 
 
 def start_memory_watchdog() -> Optional[asyncio.Task]:
-    threshold_str = os.getenv("MEM_WATCHDOG_MB", "0").strip()
-    try:
-        threshold_mb = float(threshold_str)
-    except ValueError:
-        threshold_mb = 0.0
-
-    if threshold_mb > 0:
-        return spawn(memory_watchdog_loop(), name="memory-watchdog")
-    return None
+    """Start the background memory watchdog loop."""
+    return spawn(memory_watchdog_loop(), name="memory-watchdog")

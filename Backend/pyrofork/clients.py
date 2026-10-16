@@ -3,7 +3,6 @@ import logging
 from asyncio import gather
 
 from pyrogram import Client
-from pyrogram.session import Session
 
 from Backend.config import Telegram
 from Backend.helper.custom_dl import close_streamer_for_client
@@ -14,56 +13,20 @@ from Backend.pyrofork.bot import StreamBot, client_dc_map, multi_clients, work_l
 
 logger = logging.getLogger(__name__)
 
-_orig_stop = Session.stop
+class _TCPConnectionDropFilter(logging.Filter):
+    """
+    Demote expected socket drops (connection reset by Telegram server during idle)
+    from ERROR to DEBUG to avoid noisy and alarming log spam.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR and "Send failed:" in record.getMessage():
+            msg = record.getMessage()
+            if any(err in msg for err in ("ConnectionResetError", "Connection lost", "BrokenPipeError", "ConnectionAbortedError")):
+                return False
+        return True
 
 
-async def _safe_session_stop(self, *args, **kwargs):
-    # Prevent a crashed recv_task (e.g., RuntimeError) from aborting stop()
-    # before the underlying TCP connection is properly closed.
-    recv_task = getattr(self, "recv_task", None)
-    if recv_task is not None:
-        recv_task.cancel()
-        try:
-            await recv_task
-        except BaseException:
-            pass
-        self.recv_task = None
-    return await _orig_stop(self, *args, **kwargs)
-
-
-async def _do_restart(self):
-    for attempt in range(1, 6):
-        try:
-            await self.stop()
-            await self.start()
-            return
-        except Exception as e:
-            wait_time = min(2 ** attempt, 30)
-            logger.warning(
-                f"Session restart attempt {attempt} failed ({e}). Retrying in {wait_time}s..."
-            )
-            await asyncio.sleep(wait_time)
-
-
-async def _safe_session_restart(self):
-    # If another coroutine is already restarting this Session instance,
-    # wait for the in-flight restart to finish instead of colliding with it.
-    inflight = getattr(self, "_inflight_restart_task", None)
-    if inflight is not None and not inflight.done():
-        await asyncio.shield(inflight)
-        return
-
-    task = asyncio.create_task(_do_restart(self))
-    self._inflight_restart_task = task
-    try:
-        await asyncio.shield(task)
-    finally:
-        if getattr(self, "_inflight_restart_task", None) is task:
-            self._inflight_restart_task = None
-
-
-Session.stop = _safe_session_stop
-Session.restart = _safe_session_restart
+logging.getLogger("pyrogram.connection.transport.tcp.tcp").addFilter(_TCPConnectionDropFilter())
 
 client_tokens: dict[int, str] = {}
 
