@@ -297,7 +297,8 @@ def _memory_limit_mb() -> float:
       - cgroup v2: /sys/fs/cgroup/memory.max (bytes, only when all digits)
       - cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes (bytes, only when all digits)
       - Host RAM: MemTotal from /proc/meminfo (kB)
-    Returns the smallest candidate in MB, or 0.0 if none.
+    Returns the smallest candidate in MB (cgroup limit if container-constrained,
+    or host MemTotal when unconstrained), or 0.0 if none.
     """
     candidates = []
 
