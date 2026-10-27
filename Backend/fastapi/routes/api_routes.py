@@ -576,10 +576,13 @@ async def get_admin_stats_api() -> dict:
             "status": status
         })
 
+    from Backend.helper.system_stats import get_server_system_stats
+
     return {
         "cache_size": cache_size,
         "total_bots": len(multi_clients),
-        "bot_workloads": bot_stats
+        "bot_workloads": bot_stats,
+        "server": get_server_system_stats(),
     }
 
 
@@ -2409,6 +2412,8 @@ async def get_db_stats_api() -> dict:
             except Exception:
                 pass
 
+        from Backend.helper.system_stats import get_server_system_stats
+
         return {
             "status": "success",
             "data": {
@@ -2421,6 +2426,7 @@ async def get_db_stats_api() -> dict:
                 "db_size": get_readable_file_size(total_db_size),
                 "storage_dbs": db.current_db_index,
                 "auth_channels": len(SettingsManager.current().auth_channels),
+                "server": get_server_system_stats(),
             },
         }
     except Exception as e:

@@ -337,3 +337,150 @@ def test_memory_limit_detection(monkeypatch):
     limit_max = _memory_limit_mb()
     assert limit_max == 4096.0
     assert get_watchdog_threshold_mb() == 3072.0  # 4096 * 0.75
+
+
+def test_system_stats_proc_parsers():
+    """Verify /proc parsers with valid text, malformed text, and empty inputs."""
+    from Backend.helper.system_stats import (
+        parse_meminfo,
+        parse_stat_cpu,
+        parse_loadavg,
+        parse_uptime,
+        parse_net_dev,
+        parse_proc_stat_process,
+        get_disk_usage,
+        get_server_system_stats,
+    )
+
+    # 1. meminfo
+    sample_meminfo = (
+        "MemTotal:       16384000 kB\n"
+        "MemFree:         4096000 kB\n"
+        "MemAvailable:    8192000 kB\n"
+        "Buffers:          500000 kB\n"
+        "Cached:          4000000 kB\n"
+        "SwapTotal:       2097152 kB\n"
+        "SwapFree:        1048576 kB\n"
+    )
+    mem = parse_meminfo(sample_meminfo)
+    assert mem is not None
+    assert mem["total"] == 16384000 * 1024
+    assert mem["available"] == 8192000 * 1024
+    assert mem["used"] == (16384000 - 8192000) * 1024
+    assert mem["usage_pct"] == 50.0
+    assert mem["swap_total"] == 2097152 * 1024
+    assert mem["swap_used"] == 1048576 * 1024
+    assert mem["swap_usage_pct"] == 50.0
+    assert "total_formatted" in mem
+    assert "used_formatted" in mem
+
+    # meminfo malformed/empty fallbacks
+    assert parse_meminfo("") is None
+    assert parse_meminfo("some random string without colon") is None
+    assert parse_meminfo("MemFree: 1000 kB\n") is None  # missing MemTotal
+
+    # 2. cpu stat
+    sample_stat = (
+        "cpu  1000 200 300 5000 100 0 50 0 0 0\n"
+        "cpu0 500 100 150 2500 50 0 25 0 0 0\n"
+        "cpu1 500 100 150 2500 50 0 25 0 0 0\n"
+        "intr 12345 6789\n"
+    )
+    overall, cores = parse_stat_cpu(sample_stat)
+    assert overall is not None
+    assert overall[0] == 1000 + 200 + 300 + 5000 + 100 + 0 + 50  # total
+    assert overall[1] == 5000 + 100  # idle + iowait
+    assert len(cores) == 2
+    assert "cpu0" in cores and "cpu1" in cores
+
+    # cpu stat malformed/empty fallbacks
+    assert parse_stat_cpu("") == (None, {})
+    assert parse_stat_cpu("invalid data here") == (None, {})
+
+    # 3. loadavg
+    assert parse_loadavg("0.15 0.25 0.35 1/400 12345") == [0.15, 0.25, 0.35]
+    assert parse_loadavg("") is None
+    assert parse_loadavg("invalid") is None
+
+    # 4. uptime
+    assert parse_uptime("123456.78 876543.21") == 123456.78
+    assert parse_uptime("") is None
+    assert parse_uptime("not a number") is None
+
+    # 5. net dev
+    sample_net = (
+        "Inter-|   Receive                                                |  Transmit\n"
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
+        "    lo: 1000       10    0    0    0     0          0         0     1000       10    0    0    0     0       0          0\n"
+        "  eth0: 5000       50    0    0    0     0          0         0     3000       30    0    0    0     0       0          0\n"
+    )
+    recv, sent = parse_net_dev(sample_net)
+    assert recv == 5000
+    assert sent == 3000
+    assert parse_net_dev("") == (0, 0)
+    assert parse_net_dev("corrupted net data") == (0, 0)
+
+    # 6. proc stat process
+    sample_proc = "1234 (python-worker) S 1 1234 1234 0 -1 4194304 100 0 0 0 50 25 0 0 20 0 4 0 100 10000000 100 18446744073709551615"
+    ticks = parse_proc_stat_process(sample_proc)
+    assert ticks == 50 + 25  # utime + stime
+    assert parse_proc_stat_process("") is None
+    assert parse_proc_stat_process("malformed stat string") is None
+
+    # 7. disk usage
+    disk = get_disk_usage(".")
+    assert disk is not None
+    assert disk["total"] > 0
+    assert disk["free"] >= 0
+    assert 0 <= disk["usage_pct"] <= 100
+
+    # 8. live collector
+    stats = get_server_system_stats()
+    assert isinstance(stats, dict)
+    assert "cpu" in stats
+    assert "memory" in stats
+    assert "disk" in stats
+    assert "network" in stats
+    assert "uptime" in stats
+    assert "process" in stats
+    assert "cores" in stats["cpu"]
+    assert "load_avg" in stats["cpu"]
+
+
+def test_system_stats_endpoints_auth():
+    """Verify authenticated vs unauthenticated access to admin system-stats endpoints."""
+    from Backend.fastapi.security.credentials import require_auth
+    from Backend.fastapi.routes.api_routes import get_admin_stats_api
+
+    client = TestClient(app)
+
+    # 1. Unauthenticated requests MUST return 401
+    resp1 = client.get("/api/admin/system-stats")
+    assert resp1.status_code == 401
+
+    resp2 = client.get("/api/admin/stats")
+    assert resp2.status_code == 401
+
+    # 2. Authenticated requests: verify old keys are preserved and new 'server' key is present
+    app.dependency_overrides[require_auth] = lambda: True
+    try:
+        resp_auth = client.get("/api/admin/system-stats")
+        assert resp_auth.status_code == 200
+        data = resp_auth.json()
+
+        # Existing keys must remain unchanged
+        assert "cache_size" in data
+        assert "total_bots" in data
+        assert "bot_workloads" in data
+
+        # New key 'server' must be present
+        assert "server" in data
+        srv = data["server"]
+        assert "cpu" in srv
+        assert "memory" in srv
+        assert "disk" in srv
+        assert "uptime" in srv
+        assert "process" in srv
+    finally:
+        app.dependency_overrides.pop(require_auth, None)
+

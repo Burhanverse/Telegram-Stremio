@@ -146,13 +146,55 @@
 
 /* ── Stats grid ──────────────────────────────────────────────────────────── */
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px,1fr)); gap: 0.75rem; }
+.stat-grid-server { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; }
+@media (max-width: 360px) { .stat-grid-server { grid-template-columns: 1fr; } }
 .stat-box {
     background: color-mix(in srgb, var(--bg) 55%, transparent);
     border: 1px solid var(--border); border-radius: 0.9rem;
     padding: 0.75rem 0.9rem;
+    min-width: 0;
 }
 .stat-box .v { font-size: 1.3rem; font-weight: 800; }
 .stat-box .l { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-sec); }
+.server-stat-box {
+    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    border: 1px solid var(--border); border-radius: 0.9rem;
+    padding: 0.75rem 0.9rem;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+.server-stat-box .v { font-size: 1.25rem; font-weight: 800; line-height: 1.25; }
+.server-stat-box .l { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-sec); font-weight: 600; margin-bottom: 0.2rem; }
+.stat-bar {
+    width: 100%;
+    height: 6px;
+    background: color-mix(in srgb, var(--border) 60%, transparent);
+    border-radius: 9999px;
+    overflow: hidden;
+    margin: 0.45rem 0 0.35rem 0;
+}
+.stat-bar-fill {
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 0.3s ease, background-color 0.3s ease;
+}
+.bar-green { background-color: #22c55e; }
+.bar-amber { background-color: #f59e0b; }
+.bar-red   { background-color: #ef4444; }
+.stat-sub {
+    font-size: 0.72rem;
+    color: var(--text-sec);
+    line-height: 1.35;
+    word-break: break-word;
+}
+.stat-sub-detail {
+    font-size: 0.68rem;
+    color: var(--text-sec);
+    opacity: 0.85;
+    margin-top: 0.15rem;
+}
 .hint { font-size: 0.78rem; color: var(--text-sec); }
 </style>
 
@@ -187,6 +229,17 @@
         </div>
         <div class="stat-grid" id="stats-grid">
             <div class="hint" style="grid-column:1/-1"><i class="fa-solid fa-spinner fa-spin"></i> Loading stats…</div>
+        </div>
+
+        <!-- Server (Host) stats -->
+        <div class="flex items-center justify-between mt-4 mb-2 flex-wrap gap-2">
+            <label class="s-label" style="margin-bottom:0;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-sec)">
+                <i class="fa-solid fa-microchip mr-1"></i> Server
+            </label>
+            <span id="server-stats-badge" style="font-size:0.72rem;color:var(--text-sec)"></span>
+        </div>
+        <div class="stat-grid-server" id="server-stats-grid">
+            <div class="hint" style="grid-column:1/-1"><i class="fa-solid fa-spinner fa-spin"></i> Loading server stats…</div>
         </div>
 
         <hr class="divider">
@@ -1967,6 +2020,9 @@ const STAT_FIELDS = [
     ['auth_channels', 'AUTH Channels'], ['version', 'Version'],
 ];
 let logLiveTimer = null;
+let statsAutoTimer = null;
+let statsSectionVisible = false;
+let _statsLoading = false;
 
 /* Spin the clicked refresh button's icon while an async action runs */
 function spinIcon(btn, on) {
@@ -1974,21 +2030,173 @@ function spinIcon(btn, on) {
     if (icon) icon.classList.toggle('fa-spin', on);
 }
 
+function getBarColorClass(pct) {
+    if (pct == null || isNaN(pct)) return 'bar-green';
+    if (pct >= 90) return 'bar-red';
+    if (pct >= 70) return 'bar-amber';
+    return 'bar-green';
+}
+
+function renderProgressBar(pct) {
+    if (pct == null || isNaN(pct)) return '';
+    const safePct = Math.min(100, Math.max(0, Number(pct)));
+    const colorClass = getBarColorClass(safePct);
+    return `<div class="stat-bar"><div class="stat-bar-fill ${colorClass}" style="width: ${safePct}%"></div></div>`;
+}
+
+function renderServerStats(srv, container, badge) {
+    if (!srv || !container) return;
+    const cpu = srv.cpu || {};
+    const mem = srv.memory;
+    const disk = srv.disk;
+    const net = srv.network;
+    const proc = srv.process || {};
+    const uptime = srv.uptime || {};
+
+    if (badge && net && net.label) {
+        badge.textContent = net.label;
+    }
+
+    const cpuPctStr = cpu.usage_pct != null ? `${cpu.usage_pct}%` : '—';
+    const cpuBar = renderProgressBar(cpu.usage_pct);
+    const cpuCoresStr = cpu.cores ? `${cpu.cores} Core${cpu.cores > 1 ? 's' : ''}` : 'Cores: —';
+    const loadStr = cpu.load_avg ? cpu.load_avg.join(', ') : 'N/A';
+    const perCoreSummary = cpu.per_core && cpu.per_core.length > 1
+        ? `<div class="stat-sub-detail truncate" title="${cpu.per_core.map((p, i) => `CPU ${i}: ${p}%`).join(' | ')}">Per-core: ${cpu.per_core.map(p => `${Math.round(p)}%`).join(' ')}</div>`
+        : '';
+
+    const memPctStr = mem ? (mem.usage_pct != null ? `${mem.usage_pct}%` : '—') : 'N/A';
+    const memBar = mem ? renderProgressBar(mem.usage_pct) : '';
+    const memUsedStr = mem ? `${mem.used_formatted} / ${mem.total_formatted}` : '—';
+    const swapStr = mem && mem.swap_total > 0
+        ? `Swap: ${mem.swap_used_formatted} / ${mem.swap_total_formatted}`
+        : 'Swap: None';
+
+    const diskPctStr = disk ? (disk.usage_pct != null ? `${disk.usage_pct}%` : '—') : 'N/A';
+    const diskBar = disk ? renderProgressBar(disk.usage_pct) : '';
+    const diskUsedStr = disk ? `${disk.used_formatted} / ${disk.total_formatted}` : '—';
+    const diskFreeStr = disk ? `Free: ${disk.free_formatted}` : '';
+
+    const netLabel = net ? (net.label || 'Network') : 'Network';
+    const netRates = net ? `↓ ${net.recv_rate_formatted}  ↑ ${net.sent_rate_formatted}` : 'N/A';
+    const netTotals = net ? `Total: ↓ ${net.bytes_recv_formatted} • ↑ ${net.bytes_sent_formatted}` : '—';
+
+    const procRss = proc.rss_formatted || (proc.rss_mb ? `${proc.rss_mb} MB` : '—');
+    const procCpu = proc.cpu_pct != null ? `${proc.cpu_pct}%` : '—';
+    const procThreads = proc.threads != null ? `${proc.threads} threads` : '';
+
+    const hostUp = uptime.host_formatted || 'N/A';
+    const appUp = uptime.app_formatted || 'N/A';
+
+    container.innerHTML = `
+        <div class="server-stat-box">
+            <div>
+                <div class="l">CPU (${cpuCoresStr})</div>
+                <div class="v">${cpuPctStr}</div>
+                ${cpuBar}
+            </div>
+            <div class="stat-sub">
+                <div>Load: <span style="font-weight:600">${loadStr}</span></div>
+                ${perCoreSummary}
+            </div>
+        </div>
+        <div class="server-stat-box">
+            <div>
+                <div class="l">Memory (RAM)</div>
+                <div class="v">${memPctStr}</div>
+                ${memBar}
+            </div>
+            <div class="stat-sub">
+                <div>${memUsedStr}</div>
+                <div class="stat-sub-detail">${swapStr}</div>
+            </div>
+        </div>
+        <div class="server-stat-box">
+            <div>
+                <div class="l">Disk (Host Mount)</div>
+                <div class="v">${diskPctStr}</div>
+                ${diskBar}
+            </div>
+            <div class="stat-sub">
+                <div>${diskUsedStr}</div>
+                <div class="stat-sub-detail">${diskFreeStr}</div>
+            </div>
+        </div>
+        <div class="server-stat-box">
+            <div>
+                <div class="l">${escapeHtml(netLabel)}</div>
+                <div class="v" style="font-size:1.05rem;font-weight:700">${escapeHtml(netRates)}</div>
+            </div>
+            <div class="stat-sub" style="margin-top:0.5rem">
+                <div>${escapeHtml(netTotals)}</div>
+            </div>
+        </div>
+        <div class="server-stat-box">
+            <div>
+                <div class="l">Host Uptime</div>
+                <div class="v" style="font-size:1.15rem">${escapeHtml(hostUp)}</div>
+            </div>
+            <div class="stat-sub" style="margin-top:0.5rem">
+                <div>App uptime: <span style="font-weight:600">${escapeHtml(appUp)}</span></div>
+            </div>
+        </div>
+        <div class="server-stat-box">
+            <div>
+                <div class="l">App Process (RSS)</div>
+                <div class="v">${escapeHtml(procRss)}</div>
+            </div>
+            <div class="stat-sub" style="margin-top:0.5rem">
+                <div>CPU: <span style="font-weight:600">${escapeHtml(procCpu)}</span> • ${escapeHtml(procThreads)}</div>
+            </div>
+        </div>
+    `;
+}
+
 async function loadDbStats(btn) {
+    if (_statsLoading) return;
+    _statsLoading = true;
     const grid = document.getElementById('stats-grid');
-    spinIcon(btn, true);
+    const serverGrid = document.getElementById('server-stats-grid');
+    const badge = document.getElementById('server-stats-badge');
+    if (btn) spinIcon(btn, true);
     try {
         const res = await fetch('/api/admin/stats');
         const data = await res.json();
         if (data.status !== 'success') throw new Error(data.message || 'failed');
         const s = data.data;
-        grid.innerHTML = STAT_FIELDS.map(([k, label]) =>
-            `<div class="stat-box"><div class="v">${escapeHtml(String(s[k] ?? '—'))}</div><div class="l">${label}</div></div>`
-        ).join('');
+        if (grid) {
+            grid.innerHTML = STAT_FIELDS.map(([k, label]) =>
+                `<div class="stat-box"><div class="v">${escapeHtml(String(s[k] ?? '—'))}</div><div class="l">${label}</div></div>`
+            ).join('');
+        }
+        if (serverGrid && s.server) {
+            renderServerStats(s.server, serverGrid, badge);
+        } else if (serverGrid) {
+            serverGrid.innerHTML = `<div class="hint" style="grid-column:1/-1">Server stats not available.</div>`;
+        }
     } catch (e) {
-        grid.innerHTML = `<div class="hint" style="grid-column:1/-1;color:#ef4444">Failed to load stats.</div>`;
+        if (grid) grid.innerHTML = `<div class="hint" style="grid-column:1/-1;color:#ef4444">Failed to load stats.</div>`;
+        if (serverGrid) serverGrid.innerHTML = `<div class="hint" style="grid-column:1/-1;color:#ef4444">Failed to load server stats.</div>`;
     } finally {
-        spinIcon(btn, false);
+        if (btn) spinIcon(btn, false);
+        _statsLoading = false;
+    }
+}
+
+function updateStatsTimerState() {
+    if (!document.hidden && statsSectionVisible) {
+        if (!statsAutoTimer) {
+            statsAutoTimer = setInterval(() => {
+                if (!document.hidden && statsSectionVisible) {
+                    loadDbStats();
+                }
+            }, 5000);
+        }
+    } else {
+        if (statsAutoTimer) {
+            clearInterval(statsAutoTimer);
+            statsAutoTimer = null;
+        }
     }
 }
 
@@ -2072,6 +2280,24 @@ window.addEventListener('DOMContentLoaded', () => {
     toggleMediaflowFields();
     loadDbStats();
     loadLogs();
+
+    // Auto-refresh stats every ~5s only while visible and active
+    document.addEventListener('visibilitychange', updateStatsTimerState);
+    if ('IntersectionObserver' in window) {
+        const statsRoot = document.getElementById('stats-grid');
+        if (statsRoot) {
+            const observer = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                    statsSectionVisible = entry.isIntersecting;
+                    updateStatsTimerState();
+                }
+            }, { threshold: 0.05 });
+            observer.observe(statsRoot);
+        }
+    } else {
+        statsSectionVisible = true;
+        updateStatsTimerState();
+    }
 });
 </script>
 
