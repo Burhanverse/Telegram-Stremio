@@ -269,3 +269,71 @@ def test_version_and_nuvio_endpoints():
                     routes.append(sr.path)
     assert "/api/media/tag" in routes
     assert any("nuvio-collection.json" in r for r in routes)
+
+
+def test_disk_cache_module():
+    """Verify open_disk_cache and disk_cache_stats."""
+    import shutil
+    from Backend.helper.disk_cache import CACHE_ROOT, disk_cache_stats, open_disk_cache
+
+    c = open_disk_cache("test_cache_unit", 10, "TestCache")
+    assert c is not None
+    try:
+        c["hello"] = "world"
+        assert c["hello"] == "world"
+        stats = disk_cache_stats(c, 10)
+        assert stats["items"] == 1
+        assert stats["size_limit_mb"] == 10
+        assert stats["size_bytes"] > 0
+        assert "size_mb" in stats
+    finally:
+        c.close()
+        test_dir = CACHE_ROOT / "test_cache_unit"
+        if test_dir.exists():
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    empty_stats = disk_cache_stats(None, 50)
+    assert empty_stats == {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": 50}
+
+
+def test_memory_limit_detection(monkeypatch):
+    """Verify cgroup v1/v2 and host /proc/meminfo parsing in _memory_limit_mb."""
+    import os
+    from unittest.mock import mock_open
+    from Backend.helper.memory import _memory_limit_mb, get_watchdog_threshold_mb
+
+    # Live host test: threshold should be 75% of limit
+    host_limit = _memory_limit_mb()
+    assert host_limit > 0
+    assert get_watchdog_threshold_mb() == round(host_limit * 0.75, 2)
+
+    # Simulated cgroup v2 container with 512 MB limit
+    def mock_exists(path):
+        return path in ("/sys/fs/cgroup/memory.max", "/proc/meminfo")
+
+    def mock_open_file(path, *args, **kwargs):
+        if path == "/sys/fs/cgroup/memory.max":
+            return mock_open(read_data="536870912\n")()  # 512 MB
+        elif path == "/proc/meminfo":
+            return mock_open(read_data="MemTotal:        16384000 kB\n")()  # ~16 GB
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(os.path, "exists", mock_exists)
+    monkeypatch.setattr("builtins.open", mock_open_file)
+
+    limit = _memory_limit_mb()
+    assert limit == 512.0
+    assert get_watchdog_threshold_mb() == 384.0  # 512 * 0.75
+
+    # Simulated cgroup v2 with "max" (unlimited) -> fallback to MemTotal
+    def mock_open_max(path, *args, **kwargs):
+        if path == "/sys/fs/cgroup/memory.max":
+            return mock_open(read_data="max\n")()
+        elif path == "/proc/meminfo":
+            return mock_open(read_data="MemTotal:        4194304 kB\n")()  # 4096 MB
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr("builtins.open", mock_open_max)
+    limit_max = _memory_limit_mb()
+    assert limit_max == 4096.0
+    assert get_watchdog_threshold_mb() == 3072.0  # 4096 * 0.75

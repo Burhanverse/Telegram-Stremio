@@ -334,51 +334,63 @@ def parse_mem_threshold_mb(val: Any) -> float:
     return round(num, 2)
 
 
-def get_watchdog_threshold_mb() -> float:
-    """Read MEM_WATCHDOG_MB from config.env (prefer disk if present) or environment, parsed to MB."""
-    val = None
+def _memory_limit_mb() -> float:
+    """
+    Detect the effective memory limit in MB.
+    Candidates:
+      - cgroup v2: /sys/fs/cgroup/memory.max (bytes, only when all digits)
+      - cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes (bytes, only when all digits)
+      - Host RAM: MemTotal from /proc/meminfo (kB)
+    Returns the smallest candidate in MB, or 0.0 if none.
+    """
+    candidates = []
+
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    content = f.read().strip()
+                if content.isdigit():
+                    bytes_val = int(content)
+                    if bytes_val > 0:
+                        candidates.append(bytes_val / (1024.0 * 1024.0))
+        except Exception:
+            pass
+
     try:
-        from Backend.config import CONFIG_PATH
-        from dotenv import dotenv_values
-        if os.path.exists(CONFIG_PATH):
-            cfg = dotenv_values(CONFIG_PATH)
-            val = cfg.get("MEM_WATCHDOG_MB")
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            candidates.append(int(parts[1]) / 1024.0)
+                        break
     except Exception:
         pass
 
-    if val is None or str(val).strip() == "":
-        val = os.getenv("MEM_WATCHDOG_MB", "0")
+    if not candidates:
+        return 0.0
 
-    parsed = parse_mem_threshold_mb(val)
-    if val is not None:
-        os.environ["MEM_WATCHDOG_MB"] = str(val).strip()
-    return parsed
+    return round(min(candidates), 2)
+
+
+def get_watchdog_threshold_mb() -> float:
+    """Watchdog threshold calculated as 75% of the detected memory limit."""
+    return round(_memory_limit_mb() * 0.75, 2)
 
 
 async def memory_watchdog_loop(interval_seconds: int = 60) -> None:
-    """Periodically check RSS; if above MEM_WATCHDOG_MB, trigger a background memory trim."""
+    """Periodically check RSS; if above 75% memory limit, trigger a background memory trim."""
     threshold_mb = get_watchdog_threshold_mb()
-    if threshold_mb > 0:
-        LOGGER.info(f"[Memory Watchdog] Started with threshold {threshold_mb}MB (interval {interval_seconds}s)")
-    else:
-        LOGGER.info(f"[Memory Watchdog] Started in standby (threshold disabled or 0, interval {interval_seconds}s)")
+    if threshold_mb <= 0:
+        LOGGER.info("[Memory Watchdog] Memory limit is unknown (threshold 0MB). Watchdog standing down.")
+        return
+
+    LOGGER.info(f"[Memory Watchdog] Started with threshold {threshold_mb}MB (75% limit, interval {interval_seconds}s)")
 
     while True:
         await asyncio.sleep(interval_seconds)
-
-        # Dynamically re-read so that changes in config.env or env take effect at runtime
-        current_threshold_mb = get_watchdog_threshold_mb()
-        if current_threshold_mb != threshold_mb:
-            if current_threshold_mb > 0 and threshold_mb <= 0:
-                LOGGER.info(f"[Memory Watchdog] Threshold enabled: {current_threshold_mb}MB")
-            elif current_threshold_mb <= 0 and threshold_mb > 0:
-                LOGGER.info(f"[Memory Watchdog] Threshold disabled (was {threshold_mb}MB)")
-            elif current_threshold_mb > 0:
-                LOGGER.info(f"[Memory Watchdog] Threshold updated: {threshold_mb}MB -> {current_threshold_mb}MB")
-            threshold_mb = current_threshold_mb
-
-        if threshold_mb <= 0:
-            continue
 
         rss_kb = get_rss_kb()
         rss_mb = round(rss_kb / 1024.0, 2)

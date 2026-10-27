@@ -1,7 +1,6 @@
 import asyncio
 import math
 import mimetypes
-import os
 import secrets
 import time
 from collections import deque
@@ -20,6 +19,7 @@ from Backend.fastapi.security.tokens import verify_token
 from Backend.helper.bounded import BoundedDict
 from Backend.helper.analytics import client_ip_from, record_stream_start
 from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS, ByteStreamer, _streamer_by_client, get_streamer
+from Backend.helper.disk_cache import disk_cache_stats, open_disk_cache
 from Backend.helper.encrypt import decode_string
 from Backend.helper.memory import spawn
 from Backend.helper.pyro import get_thumb_download_target
@@ -191,30 +191,10 @@ def _build_stream_headers(mime_type, file_name, req_length, range_header, start,
     return headers, status
 
 
-THUMB_CACHE_SIZE_MB = int(os.getenv("THUMB_CACHE_SIZE_MB", "2048"))
+THUMB_CACHE_SIZE_MB = 2048
 THUMB_DISK_CACHE_TTL = 7 * 86400  # 7 days
 
-_default_thumb_cache_dir = os.getenv("THUMB_CACHE_DIR", "/app/cache/thumbs")
-try:
-    os.makedirs(_default_thumb_cache_dir, exist_ok=True)
-except (PermissionError, OSError):
-    _default_thumb_cache_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-        "cache",
-        "thumbs",
-    )
-    os.makedirs(_default_thumb_cache_dir, exist_ok=True)
-
-THUMB_CACHE_DIR = _default_thumb_cache_dir
-
-_thumb_disk_cache: Optional[diskcache.Cache] = None
-try:
-    _thumb_disk_cache = diskcache.Cache(
-        THUMB_CACHE_DIR,
-        size_limit=THUMB_CACHE_SIZE_MB * 1024 * 1024,
-    )
-except Exception as e:
-    LOGGER.error(f"[ThumbCache] Failed to initialize diskcache at {THUMB_CACHE_DIR}: {e}")
+_thumb_disk_cache: Optional[diskcache.Cache] = open_disk_cache("thumbs", THUMB_CACHE_SIZE_MB, "ThumbCache")
 
 _THUMB_RAM_CACHE_SIZE_BYTES = 8 * 1024 * 1024  # ~8 MB RAM front
 _THUMB_RAM_CACHE_TTL = 3600
@@ -235,18 +215,7 @@ _thumb_cache: TTLCache = TTLCache(
 
 
 def get_thumb_disk_cache_stats() -> dict:
-    if _thumb_disk_cache is None:
-        return {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": THUMB_CACHE_SIZE_MB}
-    try:
-        vol = _thumb_disk_cache.volume()
-        return {
-            "items": len(_thumb_disk_cache),
-            "size_bytes": vol,
-            "size_mb": round(vol / (1024 * 1024), 2),
-            "size_limit_mb": THUMB_CACHE_SIZE_MB,
-        }
-    except Exception:
-        return {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": THUMB_CACHE_SIZE_MB}
+    return disk_cache_stats(_thumb_disk_cache, THUMB_CACHE_SIZE_MB)
 
 
 async def clear_thumb_caches() -> dict:

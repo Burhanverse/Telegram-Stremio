@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import gc
-import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -24,13 +23,13 @@ from Backend.helper.skip_channel import is_skip_channel, route_to_skip_channel
 from Backend.helper.split_files import parse_split_info
 from Backend.helper.subtitles import ingest_subtitle, is_subtitle_file
 
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "200"))
+SCAN_BATCH_SIZE = 200
 SCAN_MAX_EMPTY_BATCHES = 10    
 SCAN_MAX_ID_CAP = 1_000_000    
 SCAN_BATCH_DELAY = 0.5         
 SCAN_PERSIST_EVERY = 1         
 SCAN_PROBE_TEXT = "🔄"         
-SCAN_PROCESS_CONCURRENCY = int(os.getenv("SCAN_PROCESS_CONCURRENCY", "8"))   
+SCAN_PROCESS_CONCURRENCY = 8   
 
 DBCHECK_CONCURRENCY = 5        
 DBCHECK_BATCH_DELAY = 0.3      

@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import re
 from difflib import SequenceMatcher
-import os
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -13,6 +12,7 @@ from cachetools import TTLCache
 from rapidfuzz import fuzz
 
 from Backend.helper.bounded import BoundedDict
+from Backend.helper.disk_cache import disk_cache_stats, open_disk_cache
 from Backend.logger import LOGGER
 
 # Match thresholds
@@ -32,50 +32,14 @@ GRADIENT_COVER_BASE = "https://gradient-cover-api.vercel.app"
 API_SEMAPHORE = asyncio.Semaphore(12)
 
 # Two-tier cache configuration (small L1 RAM front-tier; disk cache acts as persistent L2)
-METADATA_RAM_CACHE_SIZE = int(os.getenv("METADATA_RAM_CACHE_SIZE", "64"))
-METADATA_RAM_CACHE_TTL = int(os.getenv("METADATA_RAM_CACHE_TTL", "300"))
+METADATA_RAM_CACHE_SIZE = 64
+METADATA_RAM_CACHE_TTL = 300
+METADATA_CACHE_TTL_DAYS = 7
+METADATA_DISK_CACHE_TTL = 7 * 86400
+METADATA_NEGATIVE_CACHE_TTL = 3600
+METADATA_CACHE_SIZE_MB = 10240
 
-_raw_ttl_days_env = os.getenv("METADATA_CACHE_TTL_DAYS")
-if _raw_ttl_days_env is not None:
-    _raw_ttl_days_val = int(_raw_ttl_days_env)
-elif os.getenv("METADATA_CACHE_TTL"):
-    _raw_ttl_days_val = max(1, int(os.getenv("METADATA_CACHE_TTL")) // 86400)
-else:
-    _raw_ttl_days_val = 7
-
-if _raw_ttl_days_val < 3:
-    LOGGER.warning(
-        f"[MetadataCache] METADATA_CACHE_TTL_DAYS={_raw_ttl_days_val} is below minimum (3 days). Clamping to 3."
-    )
-    METADATA_CACHE_TTL_DAYS = 3
-else:
-    METADATA_CACHE_TTL_DAYS = _raw_ttl_days_val
-
-METADATA_DISK_CACHE_TTL = METADATA_CACHE_TTL_DAYS * 86400
-METADATA_NEGATIVE_CACHE_TTL = int(os.getenv("METADATA_NEGATIVE_CACHE_TTL", "3600"))
-METADATA_CACHE_SIZE_MB = int(os.getenv("METADATA_CACHE_SIZE_MB", "10240"))
-
-_default_cache_dir = os.getenv("METADATA_CACHE_DIR", "/app/cache/metadata")
-try:
-    os.makedirs(_default_cache_dir, exist_ok=True)
-except (PermissionError, OSError):
-    _default_cache_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-        "cache",
-        "metadata",
-    )
-    os.makedirs(_default_cache_dir, exist_ok=True)
-
-METADATA_CACHE_DIR = _default_cache_dir
-
-_disk_cache: Optional[diskcache.Cache] = None
-try:
-    _disk_cache = diskcache.Cache(
-        METADATA_CACHE_DIR,
-        size_limit=METADATA_CACHE_SIZE_MB * 1024 * 1024,
-    )
-except Exception as e:
-    LOGGER.error(f"[MetadataCache] Failed to initialize diskcache at {METADATA_CACHE_DIR}: {e}")
+_disk_cache: Optional[diskcache.Cache] = open_disk_cache("metadata", METADATA_CACHE_SIZE_MB, "MetadataCache")
 
 # Shared in-RAM caches (LRU / TTL front tier)
 IMDB_CACHE: TTLCache = TTLCache(maxsize=METADATA_RAM_CACHE_SIZE, ttl=METADATA_RAM_CACHE_TTL)
@@ -107,18 +71,7 @@ def _is_empty_or_failed(result: Any) -> bool:
 
 
 def get_disk_cache_stats() -> dict:
-    if _disk_cache is None:
-        return {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": METADATA_CACHE_SIZE_MB}
-    try:
-        vol = _disk_cache.volume()
-        return {
-            "items": len(_disk_cache),
-            "size_bytes": vol,
-            "size_mb": round(vol / (1024 * 1024), 2),
-            "size_limit_mb": METADATA_CACHE_SIZE_MB,
-        }
-    except Exception:
-        return {"items": 0, "size_bytes": 0, "size_mb": 0.0, "size_limit_mb": METADATA_CACHE_SIZE_MB}
+    return disk_cache_stats(_disk_cache, METADATA_CACHE_SIZE_MB)
 
 
 def clear_metadata_ram_caches() -> int:
