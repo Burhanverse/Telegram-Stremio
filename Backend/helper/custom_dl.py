@@ -13,13 +13,13 @@ from pyrogram.errors import AuthBytesInvalid
 from pyrogram.file_id import FileId
 from pyrogram.session import Auth, Session
 from pyrogram.session.session import SessionState
-from cachetools import LRUCache
 
 from Backend import db
 from Backend.helper.exceptions import FileNotFound
 from Backend.helper.memory import spawn
 from Backend.helper.pyro import get_file_ids
 from Backend.logger import LOGGER
+from Backend.helper.bounded import BoundedDict
 from Backend.pyrofork.bot import client_avg_mbps, client_dc_map, client_failures, multi_clients, work_loads
 
 ACTIVE_STREAMS: Dict[str, Dict] = {}
@@ -74,7 +74,8 @@ class ByteStreamer:
     def __init__(self, client: Client, client_index: int = -1):
         self.client = client
         self.client_index = client_index
-        self._file_id_cache: LRUCache = LRUCache(maxsize=2048)
+        self._file_id_cache = BoundedDict(2000)
+        self._session_lock = asyncio.Lock()
         self._dc_locks = ByteStreamer._dc_locks
         self._clean_task: Optional[asyncio.Task] = None
         self._prewarm_task: Optional[asyncio.Task] = None

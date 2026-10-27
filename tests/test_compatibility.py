@@ -208,3 +208,64 @@ def test_metadata_cleaning_and_matching():
         result_year=2022,
     )
     assert score >= 0.8
+
+
+def test_bounded_dict():
+    """Verify BoundedDict capacity limiting and dict operations."""
+    from Backend.helper.bounded import BoundedDict
+    b = BoundedDict(3)
+    b["a"] = 1
+    b["b"] = 2
+    b["c"] = 3
+    assert len(b) == 3
+    assert b["a"] == 1
+    b["d"] = 4
+    assert len(b) <= 3
+    assert "d" in b
+
+
+def test_metadata_helpers_and_two_tier_cache():
+    """Verify metadata link extraction, raw ref detection, and two-tier cache."""
+    from Backend.helper.metadata import (
+        caption_with_links,
+        has_raw_ref,
+        clear_metadata_ram_caches,
+    )
+    from Backend.helper.metadata.common import get_disk_cache_stats
+
+    class DummyEntity:
+        url = "https://www.imdb.com/title/tt1375666/"
+
+    class DummyMessage:
+        caption = "Check out Inception"
+        caption_entities = [DummyEntity()]
+
+    msg = DummyMessage()
+    caption_text = caption_with_links(msg)
+    assert "https://www.imdb.com/title/tt1375666/" in caption_text
+    assert has_raw_ref(caption_text) is True
+    assert has_raw_ref("Just a plain caption") is False
+
+    cleared = clear_metadata_ram_caches()
+    assert isinstance(cleared, int)
+
+    stats = get_disk_cache_stats()
+    assert "items" in stats
+    assert "size_bytes" in stats
+
+
+def test_version_and_nuvio_endpoints():
+    """Verify version 5.3.0 and Nuvio collection routes."""
+    import Backend
+    assert Backend.__version__ == "5.3.0"
+
+    routes = []
+    for r in app.routes:
+        if hasattr(r, "path"):
+            routes.append(r.path)
+        if hasattr(r, "original_router") and hasattr(r.original_router, "routes"):
+            for sr in r.original_router.routes:
+                if hasattr(sr, "path"):
+                    routes.append(sr.path)
+    assert "/api/media/tag" in routes
+    assert any("nuvio-collection.json" in r for r in routes)

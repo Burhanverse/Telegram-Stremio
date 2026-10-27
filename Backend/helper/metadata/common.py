@@ -12,6 +12,7 @@ import diskcache
 from cachetools import TTLCache
 from rapidfuzz import fuzz
 
+from Backend.helper.bounded import BoundedDict
 from Backend.logger import LOGGER
 
 # Match thresholds
@@ -459,6 +460,19 @@ def format_imdb_images(imdb_id: str) -> dict:
         "backdrop": f"https://images.metahub.space/background/medium/{imdb_id}/img",
         "logo": f"https://images.metahub.space/logo/medium/{imdb_id}/img",
     }
+
+
+ID_REFS = re.compile(r"(?:https?://)?(?:www\.|m\.)?(?:imdb\.com/title/tt\d+|themoviedb\.org/(?:movie|tv)/\d+)\S*|\btt\d{7,10}\b", re.I)
+
+
+def has_raw_ref(text) -> bool:
+    return bool(ID_REFS.search(text or ""))
+
+
+#----- Caption plus the URLs hidden behind its text links (IMDB deeplinks)
+def caption_with_links(message) -> str:
+    urls = [e.url for e in (getattr(message, "caption_entities", None) or []) if getattr(e, "url", None)]
+    return "\n".join([getattr(message, "caption", None) or "", *urls])
 
 
 def extract_default_id(text: str) -> str | None:
