@@ -195,6 +195,17 @@
     opacity: 0.85;
     margin-top: 0.15rem;
 }
+.stat-stale-badge {
+    font-size: 0.68rem;
+    color: #f59e0b;
+    background: color-mix(in srgb, #f59e0b 12%, transparent);
+    border: 1px solid color-mix(in srgb, #f59e0b 35%, transparent);
+    padding: 0.15rem 0.5rem;
+    border-radius: 9999px;
+    display: inline-flex;
+    align-items: center;
+    font-weight: 600;
+}
 .hint { font-size: 0.78rem; color: var(--text-sec); }
 </style>
 
@@ -222,8 +233,11 @@
 
         <!-- DB & system stats -->
         <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-            <label class="s-label" style="margin-bottom:0">Database &amp; System Stats</label>
-            <button class="add-btn" type="button" onclick="loadDbStats(this)">
+            <div class="flex items-center gap-2 flex-wrap">
+                <label class="s-label" style="margin-bottom:0">Database &amp; System Stats</label>
+                <span id="db-stats-badge"></span>
+            </div>
+            <button class="add-btn" type="button" onclick="refreshAllStats(this)">
                 <i class="fa-solid fa-rotate"></i> Refresh
             </button>
         </div>
@@ -2020,14 +2034,40 @@ const STAT_FIELDS = [
     ['auth_channels', 'AUTH Channels'], ['version', 'Version'],
 ];
 let logLiveTimer = null;
-let statsAutoTimer = null;
-let statsSectionVisible = false;
-let _statsLoading = false;
+
+let _dbStatsLoadedOnce = false;
+let _dbStatsLoading = false;
+let _dbStatsLastSuccessTime = null;
+
+let _serverStatsLoadedOnce = false;
+let _serverStatsLoading = false;
+let _serverStatsLastSuccessTime = null;
+let _serverConsecutiveFailures = 0;
+let _serverPollTimer = null;
+let _serverSectionVisible = false;
 
 /* Spin the clicked refresh button's icon while an async action runs */
 function spinIcon(btn, on) {
     const icon = btn && btn.querySelector('i');
     if (icon) icon.classList.toggle('fa-spin', on);
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        if (data.status !== 'success') {
+            throw new Error(data.message || 'Request returned unsuccessful status');
+        }
+        return data;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 function getBarColorClass(pct) {
@@ -2044,46 +2084,47 @@ function renderProgressBar(pct) {
     return `<div class="stat-bar"><div class="stat-bar-fill ${colorClass}" style="width: ${safePct}%"></div></div>`;
 }
 
-function renderServerStats(srv, container, badge) {
-    if (!srv || !container) return;
-    const cpu = srv.cpu || {};
-    const mem = srv.memory;
-    const disk = srv.disk;
-    const net = srv.network;
-    const proc = srv.process || {};
-    const uptime = srv.uptime || {};
+function renderServerStats(srv, container) {
+    if (!container) return;
+    const s = srv || {};
+    const cpu = s.cpu || {};
+    const mem = s.memory;
+    const disk = s.disk;
+    const net = s.network;
+    const proc = s.process || {};
+    const uptime = s.uptime || {};
 
-    if (badge && net && net.label) {
-        badge.textContent = net.label;
-    }
-
-    const cpuPctStr = cpu.usage_pct != null ? `${cpu.usage_pct}%` : '—';
-    const cpuBar = renderProgressBar(cpu.usage_pct);
-    const cpuCoresStr = cpu.cores ? `${cpu.cores} Core${cpu.cores > 1 ? 's' : ''}` : 'Cores: —';
-    const loadStr = cpu.load_avg ? cpu.load_avg.join(', ') : 'N/A';
-    const perCoreSummary = cpu.per_core && cpu.per_core.length > 1
+    const cpuPctStr = (cpu && cpu.usage_pct != null) ? `${cpu.usage_pct}%` : '—';
+    const cpuBar = renderProgressBar(cpu ? cpu.usage_pct : null);
+    const cpuCoresStr = (cpu && cpu.cores) ? `${cpu.cores} Core${cpu.cores > 1 ? 's' : ''}` : 'Cores: —';
+    const loadStr = (cpu && cpu.load_avg && Array.isArray(cpu.load_avg)) ? cpu.load_avg.join(', ') : 'N/A';
+    const perCoreSummary = (cpu && Array.isArray(cpu.per_core) && cpu.per_core.length > 1)
         ? `<div class="stat-sub-detail truncate" title="${cpu.per_core.map((p, i) => `CPU ${i}: ${p}%`).join(' | ')}">Per-core: ${cpu.per_core.map(p => `${Math.round(p)}%`).join(' ')}</div>`
         : '';
 
-    const memPctStr = mem ? (mem.usage_pct != null ? `${mem.usage_pct}%` : '—') : 'N/A';
+    const memPctStr = mem ? ((mem.usage_pct != null) ? `${mem.usage_pct}%` : '—') : 'N/A';
     const memBar = mem ? renderProgressBar(mem.usage_pct) : '';
-    const memUsedStr = mem ? `${mem.used_formatted} / ${mem.total_formatted}` : '—';
-    const swapStr = mem && mem.swap_total > 0
-        ? `Swap: ${mem.swap_used_formatted} / ${mem.swap_total_formatted}`
+    const memUsedStr = mem ? `${mem.used_formatted || '—'} / ${mem.total_formatted || '—'}` : '—';
+    const swapStr = (mem && mem.swap_total > 0)
+        ? `Swap: ${mem.swap_used_formatted || '0B'} / ${mem.swap_total_formatted || '—'}`
         : 'Swap: None';
 
-    const diskPctStr = disk ? (disk.usage_pct != null ? `${disk.usage_pct}%` : '—') : 'N/A';
+    const diskPctStr = disk ? ((disk.usage_pct != null) ? `${disk.usage_pct}%` : '—') : 'N/A';
     const diskBar = disk ? renderProgressBar(disk.usage_pct) : '';
-    const diskUsedStr = disk ? `${disk.used_formatted} / ${disk.total_formatted}` : '—';
-    const diskFreeStr = disk ? `Free: ${disk.free_formatted}` : '';
+    const diskUsedStr = disk ? `${disk.used_formatted || '—'} / ${disk.total_formatted || '—'}` : '—';
+    const diskFreeStr = disk ? `Free: ${disk.free_formatted || '—'}` : '';
 
     const netLabel = net ? (net.label || 'Network') : 'Network';
-    const netRates = net ? `↓ ${net.recv_rate_formatted}  ↑ ${net.sent_rate_formatted}` : 'N/A';
-    const netTotals = net ? `Total: ↓ ${net.bytes_recv_formatted} • ↑ ${net.bytes_sent_formatted}` : '—';
+    const netRates = (net && net.recv_rate_formatted && net.sent_rate_formatted)
+        ? `↓ ${net.recv_rate_formatted}  ↑ ${net.sent_rate_formatted}`
+        : (net ? '0B/s' : 'N/A');
+    const netTotals = (net && net.bytes_recv_formatted && net.bytes_sent_formatted)
+        ? `Total: ↓ ${net.bytes_recv_formatted} • ↑ ${net.bytes_sent_formatted}`
+        : '—';
 
     const procRss = proc.rss_formatted || (proc.rss_mb ? `${proc.rss_mb} MB` : '—');
-    const procCpu = proc.cpu_pct != null ? `${proc.cpu_pct}%` : '—';
-    const procThreads = proc.threads != null ? `${proc.threads} threads` : '';
+    const procCpu = (proc.cpu_pct != null) ? `${proc.cpu_pct}%` : '—';
+    const procThreads = (proc.threads != null) ? `${proc.threads} threads` : '';
 
     const hostUp = uptime.host_formatted || 'N/A';
     const appUp = uptime.app_formatted || 'N/A';
@@ -2152,51 +2193,116 @@ function renderServerStats(srv, container, badge) {
     `;
 }
 
-async function loadDbStats(btn) {
-    if (_statsLoading) return;
-    _statsLoading = true;
+async function loadDbStats(isManual = false) {
+    if (_dbStatsLoading) return;
+    _dbStatsLoading = true;
     const grid = document.getElementById('stats-grid');
-    const serverGrid = document.getElementById('server-stats-grid');
-    const badge = document.getElementById('server-stats-badge');
-    if (btn) spinIcon(btn, true);
+    const badge = document.getElementById('db-stats-badge');
     try {
-        const res = await fetch('/api/admin/stats');
-        const data = await res.json();
-        if (data.status !== 'success') throw new Error(data.message || 'failed');
+        const url = isManual ? '/api/admin/stats?fresh=1' : '/api/admin/stats';
+        const data = await fetchJsonWithTimeout(url, 10000);
         const s = data.data;
-        if (grid) {
+        if (grid && s) {
             grid.innerHTML = STAT_FIELDS.map(([k, label]) =>
                 `<div class="stat-box"><div class="v">${escapeHtml(String(s[k] ?? '—'))}</div><div class="l">${label}</div></div>`
             ).join('');
+            _dbStatsLoadedOnce = true;
+            _dbStatsLastSuccessTime = new Date();
+            if (badge) badge.innerHTML = '';
         }
-        if (serverGrid && s.server) {
-            renderServerStats(s.server, serverGrid, badge);
-        } else if (serverGrid) {
-            serverGrid.innerHTML = `<div class="hint" style="grid-column:1/-1">Server stats not available.</div>`;
+    } catch (err) {
+        console.warn('[DB Stats] fetch failed:', err);
+        if (!_dbStatsLoadedOnce) {
+            if (grid) grid.innerHTML = `<div class="hint" style="grid-column:1/-1;color:#ef4444"><i class="fa-solid fa-circle-exclamation mr-1"></i> Failed to load database stats.</div>`;
+        } else if (badge) {
+            const timeStr = _dbStatsLastSuccessTime ? _dbStatsLastSuccessTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+            badge.innerHTML = `<span class="stat-stale-badge" title="Last updated: ${timeStr}"><i class="fa-solid fa-triangle-exclamation mr-1"></i> stale (${timeStr})</span>`;
         }
-    } catch (e) {
-        if (grid) grid.innerHTML = `<div class="hint" style="grid-column:1/-1;color:#ef4444">Failed to load stats.</div>`;
-        if (serverGrid) serverGrid.innerHTML = `<div class="hint" style="grid-column:1/-1;color:#ef4444">Failed to load server stats.</div>`;
     } finally {
-        if (btn) spinIcon(btn, false);
-        _statsLoading = false;
+        _dbStatsLoading = false;
     }
 }
 
-function updateStatsTimerState() {
-    if (!document.hidden && statsSectionVisible) {
-        if (!statsAutoTimer) {
-            statsAutoTimer = setInterval(() => {
-                if (!document.hidden && statsSectionVisible) {
-                    loadDbStats();
-                }
-            }, 5000);
+function getNextServerPollDelay() {
+    if (_serverConsecutiveFailures >= 3) return 30000;
+    if (_serverConsecutiveFailures >= 1) return 10000;
+    return 5000;
+}
+
+function scheduleNextServerPoll() {
+    if (_serverPollTimer) {
+        clearTimeout(_serverPollTimer);
+        _serverPollTimer = null;
+    }
+    if (!document.hidden && _serverSectionVisible) {
+        const delay = getNextServerPollDelay();
+        _serverPollTimer = setTimeout(() => {
+            if (!document.hidden && _serverSectionVisible) {
+                loadServerStats();
+            }
+        }, delay);
+    }
+}
+
+function updateServerTimerState() {
+    if (!document.hidden && _serverSectionVisible) {
+        if (!_serverPollTimer && !_serverStatsLoading) {
+            loadServerStats();
         }
     } else {
-        if (statsAutoTimer) {
-            clearInterval(statsAutoTimer);
-            statsAutoTimer = null;
+        if (_serverPollTimer) {
+            clearTimeout(_serverPollTimer);
+            _serverPollTimer = null;
         }
+    }
+}
+
+async function loadServerStats() {
+    if (_serverStatsLoading) return;
+    _serverStatsLoading = true;
+    const serverGrid = document.getElementById('server-stats-grid');
+    const badge = document.getElementById('server-stats-badge');
+    try {
+        const data = await fetchJsonWithTimeout('/api/admin/server-stats', 5000);
+        const srv = data.data;
+        _serverConsecutiveFailures = 0;
+        _serverStatsLoadedOnce = true;
+        _serverStatsLastSuccessTime = new Date();
+        if (badge) {
+            const label = (srv && srv.network && srv.network.label) ? escapeHtml(srv.network.label) : '';
+            badge.innerHTML = label ? `<span class="text-xs opacity-75">${label}</span>` : '';
+        }
+        if (serverGrid && srv) {
+            try {
+                renderServerStats(srv, serverGrid);
+            } catch (renderErr) {
+                console.error('[Server Stats] rendering error:', renderErr);
+            }
+        }
+    } catch (err) {
+        console.warn('[Server Stats] fetch failed:', err);
+        _serverConsecutiveFailures++;
+        if (!_serverStatsLoadedOnce) {
+            if (serverGrid) serverGrid.innerHTML = `<div class="hint" style="grid-column:1/-1;color:#ef4444"><i class="fa-solid fa-circle-exclamation mr-1"></i> Failed to load server stats.</div>`;
+        } else if (badge) {
+            const timeStr = _serverStatsLastSuccessTime ? _serverStatsLastSuccessTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+            badge.innerHTML = `<span class="stat-stale-badge" title="Last updated: ${timeStr}"><i class="fa-solid fa-triangle-exclamation mr-1"></i> stale (${timeStr}) · retrying</span>`;
+        }
+    } finally {
+        _serverStatsLoading = false;
+        scheduleNextServerPoll();
+    }
+}
+
+async function refreshAllStats(btn) {
+    if (btn) spinIcon(btn, true);
+    try {
+        await Promise.allSettled([
+            loadDbStats(true),
+            loadServerStats(),
+        ]);
+    } finally {
+        if (btn) spinIcon(btn, false);
     }
 }
 
@@ -2278,26 +2384,28 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     toggleDuplicateProtection();
     toggleMediaflowFields();
-    loadDbStats();
-    loadLogs();
+    // 1. Load DB stats ONCE on page load (no periodic polling timer)
+    loadDbStats(false);
 
-    // Auto-refresh stats every ~5s only while visible and active
-    document.addEventListener('visibilitychange', updateStatsTimerState);
+    // 2. Load Server stats and start visibility-aware polling
+    document.addEventListener('visibilitychange', updateServerTimerState);
     if ('IntersectionObserver' in window) {
-        const statsRoot = document.getElementById('stats-grid');
-        if (statsRoot) {
+        const serverRoot = document.getElementById('server-stats-grid') || document.getElementById('stats-grid');
+        if (serverRoot) {
             const observer = new IntersectionObserver((entries) => {
                 for (const entry of entries) {
-                    statsSectionVisible = entry.isIntersecting;
-                    updateStatsTimerState();
+                    _serverSectionVisible = entry.isIntersecting;
+                    updateServerTimerState();
                 }
             }, { threshold: 0.05 });
-            observer.observe(statsRoot);
+            observer.observe(serverRoot);
         }
     } else {
-        statsSectionVisible = true;
-        updateStatsTimerState();
+        _serverSectionVisible = true;
+        updateServerTimerState();
     }
+
+    loadLogs();
 });
 </script>
 

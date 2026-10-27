@@ -576,13 +576,10 @@ async def get_admin_stats_api() -> dict:
             "status": status
         })
 
-    from Backend.helper.system_stats import get_server_system_stats
-
     return {
         "cache_size": cache_size,
         "total_bots": len(multi_clients),
         "bot_workloads": bot_stats,
-        "server": get_server_system_stats(),
     }
 
 
@@ -2385,53 +2382,130 @@ async def purge_dead_links_api(payload: dict | None = None) -> dict:
 
 LOG_FILE = "log.txt"
 
+_DB_STATS_CACHE = None
+_DB_STATS_CACHED_AT = 0.0
+_DB_STATS_TTL = 30.0
+_DB_STATS_LOCK = asyncio.Lock()
 
-#----- Aggregate content + system metrics across all storage DBs (was /stats)
-async def get_db_stats_api() -> dict:
+
+#----- Host and server system diagnostics (decoupled from MongoDB)
+async def get_server_stats_api() -> dict:
     try:
-        total_movies = total_tv = total_episodes = total_streams = total_db_size = 0
-
-        for i in range(1, db.current_db_index + 1):
-            storage = db.dbs.get(f"storage_{i}")
-            if storage is None:
-                continue
-
-            total_movies += await storage["movie"].count_documents({})
-            async for movie in storage["movie"].find({}, {"telegram": 1}):
-                total_streams += len(movie.get("telegram", []))
-
-            total_tv += await storage["tv"].count_documents({})
-            async for show in storage["tv"].find({}, {"seasons": 1}):
-                for season in show.get("seasons", []):
-                    for episode in season.get("episodes", []):
-                        total_episodes += 1
-                        total_streams += len(episode.get("telegram", []))
-
-            try:
-                total_db_size += (await storage.command("dbStats")).get("dataSize", 0)
-            except Exception:
-                pass
-
         from Backend.helper.system_stats import get_server_system_stats
-
         return {
             "status": "success",
-            "data": {
-                "version": __version__,
-                "movies": total_movies,
-                "tv_shows": total_tv,
-                "episodes": total_episodes,
-                "streams": total_streams,
-                "uptime": get_readable_time(int(time() - StartTime)),
-                "db_size": get_readable_file_size(total_db_size),
-                "storage_dbs": db.current_db_index,
-                "auth_channels": len(SettingsManager.current().auth_channels),
-                "server": get_server_system_stats(),
-            },
+            "data": get_server_system_stats(),
         }
     except Exception as e:
-        LOGGER.error(f"[Stats] Error: {e}")
-        return {"status": "error", "message": str(e)}
+        LOGGER.error(f"[ServerStats] Error: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "data": None,
+        }
+
+
+#----- Aggregate content + system metrics across all storage DBs (was /stats)
+async def get_db_stats_api(fresh: bool = False) -> dict:
+    global _DB_STATS_CACHE, _DB_STATS_CACHED_AT
+
+    now = time()
+    if not fresh and _DB_STATS_CACHE is not None and (now - _DB_STATS_CACHED_AT) < _DB_STATS_TTL:
+        return _DB_STATS_CACHE
+
+    async with _DB_STATS_LOCK:
+        now = time()
+        if not fresh and _DB_STATS_CACHE is not None and (now - _DB_STATS_CACHED_AT) < _DB_STATS_TTL:
+            return _DB_STATS_CACHE
+
+        try:
+            total_movies = total_tv = total_episodes = total_streams = total_db_size = 0
+
+            for i in range(1, db.current_db_index + 1):
+                storage = db.dbs.get(f"storage_{i}")
+                if storage is None:
+                    continue
+
+                try:
+                    total_movies += await storage["movie"].count_documents({})
+                    movie_agg = await storage["movie"].aggregate([
+                        {
+                            "$group": {
+                                "_id": None,
+                                "total_streams": {
+                                    "$sum": {"$size": {"$ifNull": ["$telegram", []]}}
+                                }
+                            }
+                        }
+                    ]).to_list(length=1)
+                    if movie_agg:
+                        total_streams += movie_agg[0].get("total_streams", 0)
+                except Exception as e:
+                    LOGGER.warning(f"[Stats] Error aggregating movies for storage_{i}: {e}")
+
+                try:
+                    total_tv += await storage["tv"].count_documents({})
+                    tv_agg = await storage["tv"].aggregate([
+                        {
+                            "$project": {
+                                "_all_episodes": {
+                                    "$reduce": {
+                                        "input": {"$ifNull": ["$seasons.episodes", []]},
+                                        "initialValue": [],
+                                        "in": {"$concatArrays": ["$$value", {"$ifNull": ["$$this", []]}]},
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "$group": {
+                                "_id": None,
+                                "total_episodes": {"$sum": {"$size": "$_all_episodes"}},
+                                "total_streams": {
+                                    "$sum": {
+                                        "$sum": {
+                                            "$map": {
+                                                "input": "$_all_episodes",
+                                                "as": "ep",
+                                                "in": {"$size": {"$ifNull": ["$$ep.telegram", []]}},
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+                        },
+                    ]).to_list(length=1)
+                    if tv_agg:
+                        total_episodes += tv_agg[0].get("total_episodes", 0)
+                        total_streams += tv_agg[0].get("total_streams", 0)
+                except Exception as e:
+                    LOGGER.warning(f"[Stats] Error aggregating tv for storage_{i}: {e}")
+
+                try:
+                    total_db_size += (await storage.command("dbStats")).get("dataSize", 0)
+                except Exception as e:
+                    LOGGER.warning(f"[Stats] Error reading dbStats for storage_{i}: {e}")
+
+            res = {
+                "status": "success",
+                "data": {
+                    "version": __version__,
+                    "movies": total_movies,
+                    "tv_shows": total_tv,
+                    "episodes": total_episodes,
+                    "streams": total_streams,
+                    "uptime": get_readable_time(int(time() - StartTime)),
+                    "db_size": get_readable_file_size(total_db_size),
+                    "storage_dbs": db.current_db_index,
+                    "auth_channels": len(SettingsManager.current().auth_channels),
+                },
+            }
+            _DB_STATS_CACHE = res
+            _DB_STATS_CACHED_AT = time()
+            return res
+        except Exception as e:
+            LOGGER.error(f"[Stats] Error: {e}")
+            return {"status": "error", "message": str(e)}
 
 
 #----- First-run setup checklist: what's configured vs still missing

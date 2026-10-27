@@ -44,6 +44,7 @@ from Backend.fastapi.routes.api_routes import (
     get_admin_stats_api,
     get_mem_stats_api,
     get_db_stats_api,
+    get_server_stats_api,
     get_all_subscribers_api,
     get_all_tokens_api,
     get_auto_catalog_settings_api,
@@ -746,8 +747,12 @@ async def session_remove(_: bool = Depends(require_auth)):
 
 #----- System & Maintenance (WebUI replacement for /stats, /log, /restart bot commands)
 @app.get("/api/admin/stats")
-async def admin_db_stats(_: bool = Depends(require_auth)):
-    return await get_db_stats_api()
+async def admin_db_stats(fresh: bool = Query(False), _: bool = Depends(require_auth)):
+    return await get_db_stats_api(fresh=fresh)
+
+@app.get("/api/admin/server-stats")
+async def admin_server_stats(_: bool = Depends(require_auth)):
+    return await get_server_stats_api()
 
 @app.get("/api/admin/health")
 async def admin_health(_: bool = Depends(require_auth)):

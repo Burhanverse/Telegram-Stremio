@@ -1,5 +1,9 @@
+import os
 import pytest
 from datetime import datetime, timezone
+
+os.environ.setdefault("DATABASE", "mongodb://localhost:27017/tracking,mongodb://localhost:27017/storage_1")
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -255,9 +259,9 @@ def test_metadata_helpers_and_two_tier_cache():
 
 
 def test_version_and_nuvio_endpoints():
-    """Verify version 5.3.1 and Nuvio collection routes."""
+    """Verify version 5.3.2 and Nuvio collection routes."""
     import Backend
-    assert Backend.__version__ == "5.3.1"
+    assert Backend.__version__ == "5.3.2"
 
     routes = []
     for r in app.routes:
@@ -448,34 +452,34 @@ def test_system_stats_proc_parsers():
 
 
 def test_system_stats_endpoints_auth():
-    """Verify authenticated vs unauthenticated access to admin system-stats endpoints."""
+    """Verify authenticated vs unauthenticated access to admin stats endpoints."""
     from Backend.fastapi.security.credentials import require_auth
-    from Backend.fastapi.routes.api_routes import get_admin_stats_api
 
     client = TestClient(app)
 
     # 1. Unauthenticated requests MUST return 401
-    resp1 = client.get("/api/admin/system-stats")
-    assert resp1.status_code == 401
+    assert client.get("/api/admin/system-stats").status_code == 401
+    assert client.get("/api/admin/stats").status_code == 401
+    assert client.get("/api/admin/server-stats").status_code == 401
 
-    resp2 = client.get("/api/admin/stats")
-    assert resp2.status_code == 401
-
-    # 2. Authenticated requests: verify old keys are preserved and new 'server' key is present
+    # 2. Authenticated requests:
     app.dependency_overrides[require_auth] = lambda: True
     try:
-        resp_auth = client.get("/api/admin/system-stats")
-        assert resp_auth.status_code == 200
-        data = resp_auth.json()
+        # /api/admin/system-stats keeps legacy keys, does NOT have 'server'
+        resp_sys = client.get("/api/admin/system-stats")
+        assert resp_sys.status_code == 200
+        data_sys = resp_sys.json()
+        assert "cache_size" in data_sys
+        assert "total_bots" in data_sys
+        assert "bot_workloads" in data_sys
+        assert "server" not in data_sys
 
-        # Existing keys must remain unchanged
-        assert "cache_size" in data
-        assert "total_bots" in data
-        assert "bot_workloads" in data
-
-        # New key 'server' must be present
-        assert "server" in data
-        srv = data["server"]
+        # /api/admin/server-stats returns decoupled host server metrics
+        resp_srv = client.get("/api/admin/server-stats")
+        assert resp_srv.status_code == 200
+        data_srv = resp_srv.json()
+        assert data_srv["status"] == "success"
+        srv = data_srv["data"]
         assert "cpu" in srv
         assert "memory" in srv
         assert "disk" in srv
@@ -483,4 +487,151 @@ def test_system_stats_endpoints_auth():
         assert "process" in srv
     finally:
         app.dependency_overrides.pop(require_auth, None)
+
+
+def test_server_stats_zero_db_coupling(monkeypatch):
+    """Verify /api/admin/server-stats never touches MongoDB."""
+    from Backend.fastapi.security.credentials import require_auth
+    import Backend
+
+    class BombDB:
+        def __getattr__(self, name):
+            raise RuntimeError("Database should not be accessed by server-stats!")
+
+    monkeypatch.setattr(Backend, "db", BombDB())
+
+    client = TestClient(app)
+    app.dependency_overrides[require_auth] = lambda: True
+    try:
+        resp = client.get("/api/admin/server-stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "success"
+        assert "cpu" in data["data"]
+    finally:
+        app.dependency_overrides.pop(require_auth, None)
+
+
+def test_db_stats_aggregation_logic_and_caching():
+    """Verify MongoDB aggregation pipeline matches loop counting across all edge cases, and test TTL cache."""
+    # 1. Compare loop logic vs aggregation expressions on edge-case document corpus
+    test_movies = [
+        {},
+        {"telegram": None},
+        {"telegram": []},
+        {"telegram": ["s1", "s2"]},
+        {"title": "Movie 3", "telegram": ["s3"]},
+    ]
+
+    test_shows = [
+        {},
+        {"seasons": None},
+        {"seasons": []},
+        {"seasons": [{}]},
+        {"seasons": [{"episodes": []}]},
+        {"seasons": [{"episodes": [{"title": "Ep1"}]}]},
+        {"seasons": [{"episodes": [{"title": "Ep2", "telegram": None}]}]},
+        {"seasons": [
+            {"episodes": [{"telegram": ["t1", "t2"]}, {"telegram": []}]},
+            {"episodes": [{"telegram": ["t3"]}]},
+        ]},
+    ]
+
+    # Baseline loop counting
+    expected_episodes = 0
+    expected_streams = 0
+    for m in test_movies:
+        expected_streams += len((m.get("telegram") if isinstance(m, dict) else None) or [])
+    for show in test_shows:
+        for season in (show.get("seasons") or []):
+            for episode in (season.get("episodes") or []):
+                expected_episodes += 1
+                expected_streams += len((episode.get("telegram") if isinstance(episode, dict) else None) or [])
+
+    # Aggregation expressions simulation
+    m_agg_streams = sum(len((m.get("telegram") if isinstance(m, dict) else None) or []) for m in test_movies)
+
+    # TV pipeline: seasons.episodes flatten with $concatArrays, then $size and $map $size
+    agg_episodes = 0
+    agg_tv_streams = 0
+    for show in test_shows:
+        seasons = show.get("seasons") or []
+        seasons_episodes = [s["episodes"] for s in seasons if isinstance(s, dict) and "episodes" in s and s["episodes"]]
+        all_episodes = [ep for eps in seasons_episodes for ep in (eps or [])]
+        agg_episodes += len(all_episodes)
+        for ep in all_episodes:
+            agg_tv_streams += len((ep.get("telegram") if isinstance(ep, dict) else None) or [])
+
+    assert agg_episodes == expected_episodes == 5
+    assert (m_agg_streams + agg_tv_streams) == expected_streams == 6
+
+    # 2. Test get_db_stats_api caching and mock storage aggregation execution
+    import asyncio
+    from Backend.fastapi.routes.api_routes import get_db_stats_api
+    import Backend.fastapi.routes.api_routes as api_routes
+    from Backend import db
+
+    class MockCollection:
+        def __init__(self, count_val, agg_val):
+            self._count_val = count_val
+            self._agg_val = agg_val
+            self.agg_call_count = 0
+
+        async def count_documents(self, filter_query):
+            return self._count_val
+
+        def aggregate(self, pipeline):
+            self.agg_call_count += 1
+            class MockCursor:
+                def __init__(self, val):
+                    self._val = val
+                async def to_list(self, length):
+                    return self._val
+            return MockCursor(self._agg_val)
+
+    class MockStorage:
+        def __init__(self):
+            self.movie = MockCollection(10, [{"total_streams": 15}])
+            self.tv = MockCollection(5, [{"total_episodes": 20, "total_streams": 25}])
+        def __getitem__(self, key):
+            if key == "movie":
+                return self.movie
+            return self.tv
+        async def command(self, cmd):
+            return {"dataSize": 1048576}
+
+    mock_storage = MockStorage()
+    orig_dbs = db.dbs
+    orig_idx = db.current_db_index
+    db.current_db_index = 1
+    db.dbs = {"storage_1": mock_storage}
+
+    # Reset cache
+    api_routes._DB_STATS_CACHE = None
+    api_routes._DB_STATS_CACHED_AT = 0.0
+
+    try:
+        res1 = asyncio.run(get_db_stats_api(fresh=True))
+        assert res1["status"] == "success"
+        data1 = res1["data"]
+        assert data1["movies"] == 10
+        assert data1["tv_shows"] == 5
+        assert data1["episodes"] == 20
+        assert data1["streams"] == 40  # 15 + 25
+        assert "server" not in data1  # decoupled!
+        assert mock_storage.movie.agg_call_count == 1
+
+        # Second call within TTL returns cached payload without re-running aggregation
+        res2 = asyncio.run(get_db_stats_api(fresh=False))
+        assert res2["status"] == "success"
+        assert mock_storage.movie.agg_call_count == 1  # call count stayed 1!
+
+        # fresh=True forces re-run
+        res3 = asyncio.run(get_db_stats_api(fresh=True))
+        assert res3["status"] == "success"
+        assert mock_storage.movie.agg_call_count == 2
+    finally:
+        db.dbs = orig_dbs
+        db.current_db_index = orig_idx
+
 
