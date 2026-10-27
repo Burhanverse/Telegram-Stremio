@@ -10,55 +10,11 @@ import resource
 import sys
 import threading
 import time
-import tracemalloc
-from typing import Any, Coroutine, Dict, List, Optional, Set
+from typing import Any, Coroutine, Dict, Optional, Set
 
 from Backend.logger import LOGGER
 
 _TRACKED_TASKS: Set[asyncio.Task] = set()
-
-_DEBUG_MEM: bool = os.getenv("DEBUG_MEM", "").strip().lower() in ("1", "true", "yes")
-_last_snapshot: Optional[tracemalloc.Snapshot] = None
-
-if _DEBUG_MEM:
-    try:
-        if not tracemalloc.is_tracing():
-            tracemalloc.start(15)
-            _last_snapshot = tracemalloc.take_snapshot()
-            LOGGER.info("[Memory] tracemalloc started with 15 frames (DEBUG_MEM=1)")
-    except Exception as e:
-        LOGGER.warning(f"[Memory] Failed to start tracemalloc: {e}")
-
-
-def is_tracemalloc_enabled() -> bool:
-    return tracemalloc.is_tracing()
-
-
-def get_tracemalloc_diff(top_n: int = 25) -> List[Dict[str, Any]]:
-    """Return the top N allocation diffs since the last snapshot."""
-    global _last_snapshot
-    if not tracemalloc.is_tracing():
-        return []
-    try:
-        current = tracemalloc.take_snapshot()
-        if _last_snapshot is None:
-            _last_snapshot = current
-            return []
-        stats = current.compare_to(_last_snapshot, "lineno")
-        _last_snapshot = current
-        diffs = []
-        for stat in stats[:top_n]:
-            diffs.append({
-                "trace": str(stat.traceback),
-                "size_diff_kb": round(stat.size_diff / 1024.0, 2),
-                "size_kb": round(stat.size / 1024.0, 2),
-                "count_diff": stat.count_diff,
-                "count": stat.count,
-            })
-        return diffs
-    except Exception as e:
-        LOGGER.warning(f"[Memory] Error calculating tracemalloc diff: {e}")
-        return []
 
 
 def get_rss_kb() -> int:

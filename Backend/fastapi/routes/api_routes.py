@@ -585,12 +585,8 @@ async def get_admin_stats_api() -> dict:
 
 #----- Memory diagnostics
 async def get_mem_stats_api() -> dict:
-    from Backend.helper.memory import get_tracemalloc_diff, is_tracemalloc_enabled, mem_stats
-    stats = mem_stats()
-    result = {"status": "success", "data": stats}
-    if is_tracemalloc_enabled():
-        result["tracemalloc_diff"] = get_tracemalloc_diff(25)
-    return result
+    from Backend.helper.memory import mem_stats
+    return {"status": "success", "data": mem_stats()}
 
 
 #----- Clear the FileId cache across all active streamers and metadata caches
