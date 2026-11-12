@@ -1438,8 +1438,9 @@ async def list_custom_catalogs_api(
     media_type: str | None = None,
 ):
     try:
-        catalogs = await db.get_custom_catalogs()
-        if tmdb_id is not None and db_index is not None and media_type:
+        check_current = tmdb_id is not None and db_index is not None and bool(media_type)
+        catalogs = await db.get_custom_catalogs(item_fields=("tmdb_id", "db_index", "media_type") if check_current else ())
+        if check_current:
             normalized_type = _normalize_media_type(media_type)
             for catalog in catalogs:
                 catalog["contains_current"] = any(
@@ -1448,6 +1449,8 @@ async def list_custom_catalogs_api(
                     and item.get("media_type") == normalized_type
                     for item in catalog.get("items", []) or []
                 )
+        for catalog in catalogs:
+            catalog.pop("items", None)
         return {"catalogs": catalogs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1455,7 +1458,7 @@ async def list_custom_catalogs_api(
 
 async def list_manual_add_catalogs_api():
     try:
-        catalogs = await db.get_custom_catalogs()
+        catalogs = await db.get_custom_catalogs(slim=True)
         filtered = [c for c in catalogs if not c.get("auto")]
         filtered.sort(key=lambda c: (0 if c.get("exclusive") else 1, (c.get("name") or "").lower()))
         return {"catalogs": [
@@ -1673,16 +1676,16 @@ async def update_auto_catalog_settings_api(payload: dict):
 
 
 _DEFAULT_CATALOG_ENTRIES = [
-    {"id": "latest_movies", "name": "Latest Movies", "group": "Default Movies", "type": "movie"},
+    {"id": "latest_movies", "name": "Recently Added Movies", "group": "Default Movies", "type": "movie"},
     {"id": "top_movies", "name": "Popular Movies", "group": "Default Movies", "type": "movie"},
-    {"id": "latest_series", "name": "Latest Series", "group": "Default TV", "type": "series"},
+    {"id": "latest_series", "name": "Recently Added Series", "group": "Default TV", "type": "series"},
     {"id": "top_series", "name": "Popular Series", "group": "Default TV", "type": "series"},
 ]
 
 
 async def get_catalog_order_api():
     try:
-        catalogs = await db.get_custom_catalogs()
+        catalogs = await db.get_custom_catalogs(slim=True)
         entries = [dict(e) for e in _DEFAULT_CATALOG_ENTRIES]
         for c in catalogs:
             items = c.get("items") or []

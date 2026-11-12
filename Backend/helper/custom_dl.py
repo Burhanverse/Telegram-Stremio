@@ -49,7 +49,7 @@ async def _cleanup_stale_streams():
                         entry["end_ts"] = now
                         RECENT_STREAMS.appendleft(entry)
                         idx = entry.get("client_index")
-                        if idx is not None and idx in work_loads:
+                        if entry.pop("load_held", False) and idx in work_loads:
                             work_loads[idx] = max(0, work_loads[idx] - 1)
                 except Exception:
                     pass
@@ -86,8 +86,9 @@ class ByteStreamer:
     def start(self) -> None:
         if self._clean_task is None or self._clean_task.done():
             self._clean_task = spawn(self._clean_cache(), name=f"bytestreamer_clean_{self.client_index}")
-        # Eager background prewarming of all 4 DCs is disabled to prevent idle TCP disconnects.
-        # Media sessions are opened lazily on demand when a stream actually plays a file from that DC.
+        from Backend.config import Telegram
+        if Telegram.PREWARM_DCS and (self._prewarm_task is None or self._prewarm_task.done()):
+            self._prewarm_task = spawn(self._prewarm_sessions(), name=f"bytestreamer_prewarm_{self.client_index}")
         _ensure_stale_cleaner()
 
     async def close(self) -> None:
@@ -115,10 +116,38 @@ class ByteStreamer:
         self._file_id_cache.clear()
 
     async def _prewarm_sessions(self):
-        # Eager DC pre-warming is disabled to prevent idle TCP connections from accumulating
-        # and timing out while the server is not actively streaming.
-        # Media sessions are opened lazily on demand per DC in generate_media_session().
-        pass
+        common_dcs = [1, 2, 4, 5]
+        test_mode = await self.client.storage.test_mode()
+        current_dc = await self.client.storage.dc_id()
+        for dc in common_dcs:
+            if dc in self.client.media_sessions:
+                continue
+            try:
+                auth_key = await self.client.storage.auth_key() if dc == current_dc else await Auth(self.client, dc, test_mode).create()
+                session = Session(self.client, dc, auth_key, test_mode, is_media=True)
+                session.no_updates = True
+                session.timeout = 30
+                session.sleep_threshold = 60
+                await session.start()
+                imported = dc == current_dc
+                for _ in range(0 if imported else 6):
+                    try:
+                        exported = await self.client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc))
+                        await session.send(raw.functions.auth.ImportAuthorization(id=exported.id,bytes=exported.bytes,))
+                        imported = True
+                        break
+                    except AuthBytesInvalid:
+                        await asyncio.sleep(0.5)
+                    except OSError:
+                        await asyncio.sleep(1)
+                    except Exception:
+                        break
+                if imported and dc not in self.client.media_sessions:
+                    self.client.media_sessions[dc] = session
+                else:
+                    await session.stop()
+            except Exception:
+                continue
 
     #----- Fetch (and cache) Telegram FileId properties for a message
     async def get_file_properties(self, chat_id: int, message_id: int) -> FileId:
@@ -171,6 +200,7 @@ class ByteStreamer:
             "part_count": part_count,
             "prefetch": prefetch,
             "meta": meta or {},
+            "load_held": True,
         }
 
         ACTIVE_STREAMS[stream_id] = registry_entry
@@ -214,12 +244,10 @@ class ByteStreamer:
                     LOGGER.warning("Skipping extra client %s (session setup failed): %s", ec_idx, e)
 
         async def fetch_chunk_with_retries(seq_idx: int, off: int) -> Tuple[int, Optional[bytes]]:
-            slot = seq_idx % len(session_pool)
-            c_idx, c_session, c_loc_box, c_refresh = session_pool[slot]
-
             tries = 0
             flood_tries = 0
             while tries < 3 and flood_tries < 5 and not stop_event.is_set():
+                c_idx, c_session, c_loc_box, c_refresh = session_pool[(seq_idx + tries) % len(session_pool)]
                 try:
                     r = await asyncio.wait_for(
                         c_session.send(
@@ -495,10 +523,8 @@ class ByteStreamer:
                             pass
 
                     spawn(delayed_pop(), name=f"delayed_pop_{stream_id}")
-                    try:
-                        work_loads[client_index] -= 1
-                    except Exception:
-                        pass
+                    if stream_entry.pop("load_held", False):
+                        work_loads[client_index] = max(0, work_loads.get(client_index, 0) - 1)
 
                 stop_event.set()
 
@@ -693,7 +719,6 @@ async def _speed_test_single_client(
                     chunk = getattr(r, "bytes", None)
                     if not chunk:
                         eof_reached = True
-                        queue.task_done()
                         continue
                     bytes_got = len(chunk)
                     total_bytes += bytes_got
