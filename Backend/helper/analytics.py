@@ -1,3 +1,4 @@
+import ipaddress
 import time
 from datetime import datetime, timedelta
 
@@ -80,16 +81,36 @@ _DEVICE_MAP = [
 ]
 
 
+def _is_trusted_proxy_peer(peer: str) -> bool:
+    if not peer or peer in ("localhost", "testclient"):
+        return True
+    try:
+        ip = ipaddress.ip_address(peer)
+        return ip.is_loopback or ip.is_private
+    except ValueError:
+        return False
+
+
 #----- Real client IP behind Cloudflare / Caddy / reverse proxies
 def client_ip_from(request) -> str:
-    for h in ("cf-connecting-ip", "x-real-ip"):
-        v = request.headers.get(h)
-        if v:
-            return v.strip()
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    peer = request.client.host if (request and getattr(request, "client", None)) else ""
+    try:
+        from Backend.config import Telegram
+        trust_mode = getattr(Telegram, "TRUST_PROXIES", "auto")
+    except Exception:
+        trust_mode = "auto"
+
+    should_trust = True if trust_mode == "true" else (False if trust_mode == "false" else _is_trusted_proxy_peer(peer))
+
+    if should_trust and hasattr(request, "headers"):
+        for h in ("cf-connecting-ip", "x-real-ip"):
+            v = request.headers.get(h)
+            if v:
+                return v.strip()
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    return peer
 
 
 def parse_app(user_agent: str) -> str:

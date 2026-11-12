@@ -39,6 +39,7 @@ class Telegram:
     ADMIN_USERNAME                = getenv("ADMIN_USERNAME", "admin")
     ADMIN_PASSWORD                = getenv("ADMIN_PASSWORD", "admin")
     PREWARM_DCS                   = getenv("PREWARM_DCS", "false").lower() == "true"
+    TRUST_PROXIES                 = getenv("TRUST_PROXIES", "auto").strip().lower()
     SUBSCRIPTION                  = getenv("SUBSCRIPTION", "false").lower() == "true"
     SUBSCRIPTION_GROUP_ID         = _int_env("SUBSCRIPTION_GROUP_ID")
     APPROVER_IDS                  = [int(x.strip()) for x in (getenv("APPROVER_IDS") or "").split(",") if x.strip().isdigit()]
