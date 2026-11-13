@@ -158,6 +158,40 @@ async def test_start_clients_staggered_concurrency_and_delay(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_start_clients_staggered_default_config(monkeypatch):
+    """Verify start_clients_staggered defaults to concurrency=1 and delay=5.0s."""
+    sleep_calls = []
+
+    async def mock_sleep(d):
+        sleep_calls.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+    active_count = 0
+    max_active = 0
+
+    async def mock_start(cid, token):
+        nonlocal active_count, max_active
+        active_count += 1
+        if active_count > max_active:
+            max_active = active_count
+        active_count -= 1
+        return cid, MagicMock()
+
+    monkeypatch.setattr(clients_mod, "start_client", mock_start)
+
+    tokens = {1: "tok1", 2: "tok2", 3: "tok3"}
+    # Call without passing concurrency or delay -> uses defaults (1 and 5.0)
+    results = await clients_mod.start_clients_staggered(tokens)
+
+    assert len(results) == 3
+    assert max_active == 1  # Concurrency is strictly 1
+    # For 3 items with batch size 1, delays occur after item 1 and item 2 (2 delays)
+    assert len(sleep_calls) == 2
+    assert all(s == 5.0 for s in sleep_calls)
+
+
+@pytest.mark.asyncio
 async def test_reload_multi_token_clients_partial_failure(monkeypatch):
     """Verify reload_multi_token_clients() filters out None before unpacking on partial failure."""
     mock_settings = MagicMock()

@@ -47,8 +47,8 @@ class Telegram:
     ADMIN_USERNAME                = getenv("ADMIN_USERNAME", "admin")
     ADMIN_PASSWORD                = getenv("ADMIN_PASSWORD", "admin")
     PREWARM_DCS                   = getenv("PREWARM_DCS", "false").lower() == "true"
-    CLIENT_INIT_CONCURRENCY       = _int_env("CLIENT_INIT_CONCURRENCY", 3)
-    CLIENT_INIT_DELAY             = _float_env("CLIENT_INIT_DELAY", 0.5)
+    CLIENT_INIT_CONCURRENCY       = _int_env("CLIENT_INIT_CONCURRENCY", 1)
+    CLIENT_INIT_DELAY             = _float_env("CLIENT_INIT_DELAY", 5.0)
     TRUST_PROXIES                 = getenv("TRUST_PROXIES", "auto").strip().lower()
     SUBSCRIPTION                  = getenv("SUBSCRIPTION", "false").lower() == "true"
     SUBSCRIPTION_GROUP_ID         = _int_env("SUBSCRIPTION_GROUP_ID")

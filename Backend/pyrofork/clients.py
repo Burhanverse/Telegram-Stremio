@@ -100,8 +100,8 @@ async def start_clients_staggered(
     if not tokens:
         return []
 
-    c_limit = max(1, concurrency if concurrency is not None else getattr(Telegram, "CLIENT_INIT_CONCURRENCY", 3) or 3)
-    c_delay = max(0.0, delay if delay is not None else (getattr(Telegram, "CLIENT_INIT_DELAY", 0.5) if getattr(Telegram, "CLIENT_INIT_DELAY", 0.5) is not None else 0.5))
+    c_limit = max(1, concurrency if concurrency is not None else getattr(Telegram, "CLIENT_INIT_CONCURRENCY", 1) or 1)
+    c_delay = max(0.0, delay if delay is not None else (getattr(Telegram, "CLIENT_INIT_DELAY", 5.0) if getattr(Telegram, "CLIENT_INIT_DELAY", 5.0) is not None else 5.0))
     sem = asyncio.Semaphore(c_limit)
 
     async def _guarded_start(cid: int, tok: str) -> Optional[Tuple[int, Client]]:
