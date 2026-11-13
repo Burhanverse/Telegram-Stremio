@@ -4,7 +4,7 @@ import mimetypes
 import secrets
 import time
 from collections import deque
-from typing import Dict, Optional
+from typing import Optional
 from urllib.parse import quote, unquote
 
 import diskcache
@@ -16,9 +16,8 @@ from cachetools import TTLCache
 
 from Backend import db
 from Backend.fastapi.security.tokens import verify_token
-from Backend.helper.bounded import BoundedDict
 from Backend.helper.analytics import client_ip_from, record_stream_start
-from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS, ByteStreamer, _streamer_by_client, get_streamer
+from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS, ByteStreamer, _streamer_by_client as _streamer_by_client, get_streamer
 from Backend.helper.disk_cache import disk_cache_stats, open_disk_cache
 from Backend.helper.encrypt import decode_string
 from Backend.helper.memory import spawn

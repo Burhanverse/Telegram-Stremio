@@ -6,9 +6,8 @@ from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from Backend import StartTime, __version__, db
-from Backend.config import Telegram
 from Backend.fastapi.security.credentials import get_current_user, is_authenticated, require_auth, revoke_session, verify_credentials
-from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_all_themes, get_all_styles, get_theme, get_request_theme
+from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_all_themes, get_all_styles, get_request_theme
 from Backend.helper.analytics import client_ip_from, get_activity_overview
 from Backend.helper.bounded import BoundedDict
 from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS

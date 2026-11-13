@@ -7,6 +7,7 @@ from pyrogram import idle
 from starlette.middleware.sessions import SessionMiddleware
 
 from Backend import __version__, db
+from Backend.config import Telegram
 from Backend.fastapi import server
 from Backend.fastapi.main import app
 from Backend.helper import subscription_task_manager
@@ -93,6 +94,7 @@ async def start_services():
         await idle()
     except Exception:
         LOGGER.error("Error during startup:\n" + format_exc())
+        raise
 
 
 #----- Cancel pending tasks and shut clients down
@@ -106,9 +108,15 @@ async def stop_services():
             task.cancel()
         await asyncio.gather(*pending_tasks, return_exceptions=True)
 
-        await StreamBot.stop()
+        try:
+            await StreamBot.stop()
+        except asyncio.CancelledError:
+            pass
         if botmod.Userbot is not None:
-            await botmod.Userbot.stop()
+            try:
+                await botmod.Userbot.stop()
+            except asyncio.CancelledError:
+                pass
 
         await db.disconnect()
         LOGGER.info("Services stopped successfully.")

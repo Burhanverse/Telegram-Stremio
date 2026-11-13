@@ -4,14 +4,13 @@ from __future__ import annotations
 import asyncio
 import re
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 from urllib.parse import quote
 
 import diskcache
 from cachetools import TTLCache
 from rapidfuzz import fuzz
 
-from Backend.helper.bounded import BoundedDict
 from Backend.helper.disk_cache import disk_cache_stats, open_disk_cache
 from Backend.logger import LOGGER
 

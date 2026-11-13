@@ -22,7 +22,7 @@ from Backend.helper.analytics import client_ip_from, record_client
 from Backend.fastapi.security.tokens import verify_token
 from Backend.helper.cf_stream import cf_enabled, cf_stream_url
 from Backend.helper.memory import spawn
-from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_theme, get_request_theme
+from Backend.fastapi.themes import get_request_theme
 from Backend.helper.fanart import fanart_artwork
 from Backend.helper.global_search import global_search, is_global_search_enabled
 from Backend.helper.metadata.providers.cinemeta import get_detail, get_season
