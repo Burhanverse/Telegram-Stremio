@@ -259,9 +259,9 @@ def test_metadata_helpers_and_two_tier_cache():
 
 
 def test_version_and_nuvio_endpoints():
-    """Verify version 5.3.3 and Nuvio collection routes."""
+    """Verify version 5.3.4 and Nuvio collection routes."""
     import Backend
-    assert Backend.__version__ == "5.3.3"
+    assert Backend.__version__ == "5.3.4"
 
     routes = []
     for r in app.routes:
