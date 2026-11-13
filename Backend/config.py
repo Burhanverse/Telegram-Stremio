@@ -13,6 +13,14 @@ def _int_env(key: str, default: int = 0) -> int:
         return default
 
 
+def _float_env(key: str, default: float = 0.0) -> float:
+    try:
+        val = (getenv(key) or "").strip()
+        return float(val) if val else default
+    except ValueError:
+        return default
+
+
 #----- Environment-backed configuration
 class Telegram:
     #----- Required: Telegram clients
@@ -39,6 +47,8 @@ class Telegram:
     ADMIN_USERNAME                = getenv("ADMIN_USERNAME", "admin")
     ADMIN_PASSWORD                = getenv("ADMIN_PASSWORD", "admin")
     PREWARM_DCS                   = getenv("PREWARM_DCS", "false").lower() == "true"
+    CLIENT_INIT_CONCURRENCY       = _int_env("CLIENT_INIT_CONCURRENCY", 3)
+    CLIENT_INIT_DELAY             = _float_env("CLIENT_INIT_DELAY", 0.5)
     TRUST_PROXIES                 = getenv("TRUST_PROXIES", "auto").strip().lower()
     SUBSCRIPTION                  = getenv("SUBSCRIPTION", "false").lower() == "true"
     SUBSCRIPTION_GROUP_ID         = _int_env("SUBSCRIPTION_GROUP_ID")

@@ -143,3 +143,30 @@ async def test_stop_services_handles_cancelled_error(mock_startup_environment):
     await main_mod.stop_services()
     assert mock_startup_environment["StreamBot"].stop.called
     assert mock_startup_environment["db"].disconnect.called
+
+
+@pytest.mark.asyncio
+async def test_startup_services_with_client_floodwait_smoke(mock_startup_environment, monkeypatch):
+    """Verify start_services() boots completely when a secondary client hits FloodWait and returns None."""
+    import Backend.pyrofork.clients as real_clients_mod
+    monkeypatch.setattr(main_mod, "initialize_clients", real_clients_mod.initialize_clients)
+
+    mock_settings = MagicMock()
+    mock_settings.session_secret = "test-secret"
+    mock_settings.extra_databases = []
+    mock_settings.multi_tokens = ["bad_tok", "good_tok"]
+    monkeypatch.setattr(main_mod.SettingsManager, "current", MagicMock(return_value=mock_settings))
+
+    mock_good_client = MagicMock()
+    async def mock_start(cid, token):
+        if token == "good_tok":
+            return cid, mock_good_client
+        return None  # Emulate FloodWait or error caught in start_client
+
+    monkeypatch.setattr(real_clients_mod, "start_client", mock_start)
+    monkeypatch.setattr(main_mod.StreamBot.storage, "dc_id", AsyncMock(return_value=1))
+
+    await main_mod.start_services()
+
+    assert mock_startup_environment["StreamBot"].start.called
+    assert mock_startup_environment["idle"].called

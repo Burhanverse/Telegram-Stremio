@@ -1,7 +1,9 @@
+import asyncio
 import logging
-from asyncio import gather
+from typing import Optional, Tuple
 
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 from Backend.config import Telegram
 from Backend.helper.custom_dl import close_streamer_for_client
@@ -39,7 +41,7 @@ class TokenParser:
 
 
 #----- Start a single bot client and register its DC/workload
-async def start_client(client_id: int, token: str):
+async def start_client(client_id: int, token: str) -> Optional[Tuple[int, Client]]:
     try:
         LOGGER.info(f"Starting - Bot Client {client_id}")
         client = await Client(
@@ -62,6 +64,12 @@ async def start_client(client_id: int, token: str):
 
         work_loads[client_id] = 0
         return client_id, client
+    except FloodWait as e:
+        wait_s = getattr(e, "value", e)
+        LOGGER.warning(
+            f"Client {client_id} hit Telegram FloodWait: please wait {wait_s}s before connecting. Skipping this client."
+        )
+        return None
     except Exception as e:
         LOGGER.error(f"Failed to start Client - {client_id} Error: {e}", exc_info=True)
         return None
@@ -83,6 +91,37 @@ async def stop_client(client_id: int) -> None:
             LOGGER.warning(f"Error stopping Client {client_id}: {e}")
 
 
+#----- Start a batch of clients in a staggered fashion with concurrency limits
+async def start_clients_staggered(
+    tokens: dict[int, str],
+    concurrency: Optional[int] = None,
+    delay: Optional[float] = None,
+) -> list[Optional[Tuple[int, Client]]]:
+    if not tokens:
+        return []
+
+    c_limit = max(1, concurrency if concurrency is not None else getattr(Telegram, "CLIENT_INIT_CONCURRENCY", 3) or 3)
+    c_delay = max(0.0, delay if delay is not None else (getattr(Telegram, "CLIENT_INIT_DELAY", 0.5) if getattr(Telegram, "CLIENT_INIT_DELAY", 0.5) is not None else 0.5))
+    sem = asyncio.Semaphore(c_limit)
+
+    async def _guarded_start(cid: int, tok: str) -> Optional[Tuple[int, Client]]:
+        async with sem:
+            return await start_client(cid, tok)
+
+    items = list(tokens.items())
+    results: list[Optional[Tuple[int, Client]]] = []
+
+    for i in range(0, len(items), c_limit):
+        batch = items[i : i + c_limit]
+        tasks = [spawn(_guarded_start(cid, tok), name=f"start-client-{cid}") for cid, tok in batch]
+        batch_results = await asyncio.gather(*tasks)
+        results.extend(batch_results)
+        if i + c_limit < len(items) and c_delay > 0:
+            await asyncio.sleep(c_delay)
+
+    return results
+
+
 #----- Bring up the main client plus every configured extra client
 async def initialize_clients() -> None:
     multi_clients[0], work_loads[0] = StreamBot, 0
@@ -100,10 +139,9 @@ async def initialize_clients() -> None:
         LOGGER.info("No additional Bot Clients found, Using default client")
         return
 
-    tasks = [spawn(start_client(i, token), name=f"start-client-{i}") for i, token in all_tokens.items()]
-    results = await gather(*tasks)
+    results = await start_clients_staggered(all_tokens)
 
-    started = {client_id: client for client_id, client in results if client}
+    started = {res[0]: res[1] for res in results if res}
     multi_clients.update(started)
     for client_id, token in all_tokens.items():
         if client_id in started:
@@ -129,9 +167,8 @@ async def reload_multi_token_clients() -> dict:
     to_start = {cid: tok for cid, tok in new_tokens.items() if cid not in old_ids or client_tokens.get(cid) != tok}
 
     if to_start:
-        tasks = [spawn(start_client(cid, tok), name=f"reload-client-{cid}") for cid, tok in to_start.items()]
-        results = await gather(*tasks)
-        started = {cid: client for cid, client in results if client}
+        results = await start_clients_staggered(to_start)
+        started = {res[0]: res[1] for res in results if res}
         multi_clients.update(started)
         for cid, tok in to_start.items():
             if cid in started:
