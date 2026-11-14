@@ -51,6 +51,9 @@ class Database:
         self.dbs: Dict[str, motor.motor_asyncio.AsyncIOMotorDatabase] = {}
 
         self.current_db_index = 1
+        self._hidden_catalogs_cache: Optional[List[str]] = None
+        self._hidden_catalogs_cache_time: float = 0.0
+        self._hidden_catalogs_ttl: float = 60.0
 
     async def connect(self):
         try:
@@ -183,12 +186,20 @@ class Database:
         return list((doc or {}).get("order", []))
 
     async def get_hidden_catalogs(self) -> List[str]:
+        now = time.monotonic()
+        if self._hidden_catalogs_cache is not None and (now - self._hidden_catalogs_cache_time) < self._hidden_catalogs_ttl:
+            return list(self._hidden_catalogs_cache)
         doc = await self.dbs["tracking"]["state"].find_one({"_id": "catalog_hidden"})
-        return list((doc or {}).get("keys", []))
+        keys = list((doc or {}).get("keys", []))
+        self._hidden_catalogs_cache = keys
+        self._hidden_catalogs_cache_time = now
+        return list(keys)
 
     async def save_hidden_catalogs(self, keys: List[str]) -> None:
         await self.dbs["tracking"]["state"].update_one(
             {"_id": "catalog_hidden"}, {"$set": {"keys": [str(x) for x in keys]}}, upsert=True)
+        self._hidden_catalogs_cache = None
+        self._hidden_catalogs_cache_time = 0.0
 
     async def save_catalog_order(self, order: List[str]) -> bool:
         await self.dbs["tracking"]["state"].update_one(
