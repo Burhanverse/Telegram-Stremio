@@ -125,7 +125,6 @@ async def plan_selection(client: Client, callback_query: CallbackQuery):
         await callback_query.message.reply_text(
             text + "\n\n⚠️ <i>Please start a DM with the bot first by clicking its username, then send your screenshot there.</i>",
             reply_markup=ForceReply(selective=True),
-            quote=True,
         )
         await callback_query.answer()
 
@@ -148,8 +147,7 @@ async def handle_payment_screenshot(client: Client, message: Message):
             LOGGER.debug(f"No pending_payment found for {sender_id}")
             await message.reply_text(
                 "ℹ️ We received your photo, but you don't have an active payment request.\n\n"
-                "Please use /start to select a subscription plan first, then send your payment screenshot.",
-                quote=True
+                "Please use /start to select a subscription plan first, then send your payment screenshot."
             )
             return
 
@@ -191,21 +189,18 @@ async def handle_payment_screenshot(client: Client, message: Message):
             await message.reply_text(
                 "✅ <b>Screenshot Received!</b>\n\n"
                 "Your payment screenshot has been forwarded to the admin for review.\n"
-                "You will be notified once it's approved. Thank you! 🙏",
-                quote=True
+                "You will be notified once it's approved. Thank you! 🙏"
             )
         else:
             await message.reply_text(
                 "⚠️ Your screenshot was received but we could not reach the admin. "
-                "Please contact the admin directly.",
-                quote=True
+                "Please contact the admin directly."
             )
 
     except Exception as e:
         LOGGER.error(f"Error in handle_payment_screenshot: {e}")
         await message.reply_text(
-            f"⚠️ Something went wrong while processing your screenshot. Please try again or contact the admin.\n\nError: {e}",
-            quote=True
+            f"⚠️ Something went wrong while processing your screenshot. Please try again or contact the admin.\n\nError: {e}"
         )
 
 

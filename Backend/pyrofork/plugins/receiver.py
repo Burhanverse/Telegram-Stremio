@@ -299,7 +299,6 @@ async def file_receive_handler(client: Client, message: Message):
         await asleep(e.value)
         await message.reply_text(
             text=f"Got Floodwait of {str(e.value)}s",
-            disable_web_page_preview=True,
             parse_mode=ParseMode.MARKDOWN
         )
 
